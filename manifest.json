@@ -1,10 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Browser AI Connector",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Use locally stored AI provider credentials from supported browser applications.",
   "permissions": ["storage"],
-  "host_permissions": ["https://api.openai.com/*", "https://api.anthropic.com/*", "https://generativelanguage.googleapis.com/*"],
+  "host_permissions": ["https://api.openai.com/*", "https://api.anthropic.com/*", "https://generativelanguage.googleapis.com/*", "https://apihub.agnes-ai.com/*", "https://*.openai.azure.com/*", "https://login.microsoftonline.com/*"],
+  "optional_host_permissions": ["https://*/*", "http://*/*"],
   "background": {
     "service_worker": "src/background.js",
     "type": "module"

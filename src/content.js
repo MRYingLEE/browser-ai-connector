@@ -3,13 +3,62 @@
   const calls = new Map();
   const workerBridges = new Map();
 
+  async function publishCustomProviderEndpoints() {
+    try {
+      const endpoints = await chrome.runtime.sendMessage({ type: 'list-custom-endpoints' });
+      window.postMessage({ channel, type: 'custom-provider-endpoints', endpoints }, window.location.origin);
+    } catch {
+      window.postMessage({ channel, type: 'custom-provider-endpoints', endpoints: [] }, window.location.origin);
+    }
+  }
+
+  function connectProviderRelay() {
+    try {
+      return chrome.runtime.connect({ name: 'provider-relay' });
+    } catch {
+      return null;
+    }
+  }
+
+  function postProviderMessage(port, message) {
+    try {
+      port.postMessage(message);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function disconnectProviderPort(port) {
+    try {
+      port.disconnect();
+    } catch {}
+  }
+
+  function routeNative(message, workerChannel) {
+    window.postMessage({
+      channel,
+      ...(workerChannel ? { direction: 'worker-extension', workerChannel } : { direction: 'extension' }),
+      type: 'route',
+      id: message.id,
+      route: 'native',
+    }, window.location.origin);
+  }
+
+  void publishCustomProviderEndpoints();
+  try {
+    chrome.storage.onChanged.addListener((changes, areaName) => {
+      if (areaName === 'local' && changes.customProviderAssignments) void publishCustomProviderEndpoints();
+    });
+  } catch {}
+
   function closeWorkerBridge(workerChannel) {
     const bridge = workerBridges.get(workerChannel);
     if (!bridge) return;
     workerBridges.delete(workerChannel);
     for (const [id, port] of bridge.calls) {
-      port.postMessage({ type: 'cancel', id });
-      port.disconnect();
+      postProviderMessage(port, { type: 'cancel', id });
+      disconnectProviderPort(port);
     }
     bridge.calls.clear();
   }
@@ -29,37 +78,52 @@
     if (!bridge) return;
     if (message?.type === 'request') {
       if (bridge.calls.has(message.id)) return;
-      const port = chrome.runtime.connect({ name: 'provider-relay' });
+      const port = connectProviderRelay();
+      if (!port) {
+        routeNative(message, workerChannel);
+        return;
+      }
       bridge.calls.set(message.id, port);
-      port.onMessage.addListener((reply) => {
-        if (bridge.calls.get(message.id) !== port) return;
-        window.postMessage({ channel, direction: 'worker-extension', workerChannel, ...reply }, window.location.origin);
-        if (['route', 'response-end', 'error'].includes(reply.type)) {
+      try {
+        port.onMessage.addListener((reply) => {
+          if (bridge.calls.get(message.id) !== port) return;
+          window.postMessage({ channel, direction: 'worker-extension', workerChannel, ...reply }, window.location.origin);
+          if (['route', 'response-end', 'error'].includes(reply.type)) {
+            bridge.calls.delete(message.id);
+            disconnectProviderPort(port);
+          }
+        });
+        port.onDisconnect.addListener(() => {
+          if (bridge.calls.get(message.id) !== port) return;
           bridge.calls.delete(message.id);
-          port.disconnect();
-        }
-      });
-      port.onDisconnect.addListener(() => {
-        if (bridge.calls.get(message.id) !== port) return;
+          window.postMessage({
+            channel,
+            direction: 'worker-extension',
+            workerChannel,
+            type: 'error',
+            id: message.id,
+          }, window.location.origin);
+        });
+      } catch {
         bridge.calls.delete(message.id);
-        window.postMessage({
-          channel,
-          direction: 'worker-extension',
-          workerChannel,
-          type: 'error',
-          id: message.id,
-        }, window.location.origin);
-      });
-      port.postMessage(message);
+        disconnectProviderPort(port);
+        routeNative(message, workerChannel);
+        return;
+      }
+      if (!postProviderMessage(port, message)) {
+        bridge.calls.delete(message.id);
+        disconnectProviderPort(port);
+        routeNative(message, workerChannel);
+      }
       return;
     }
     const port = bridge.calls.get(message?.id);
     if (!port) return;
-    if (message.type === 'ack') port.postMessage(message);
+    if (message.type === 'ack') postProviderMessage(port, message);
     if (message.type === 'cancel') {
-      port.postMessage(message);
+      postProviderMessage(port, message);
       bridge.calls.delete(message.id);
-      port.disconnect();
+      disconnectProviderPort(port);
     }
   }
 
@@ -83,27 +147,50 @@
     }
 
     if (message.type === 'request') {
-      const port = chrome.runtime.connect({ name: 'provider-relay' });
+      const port = connectProviderRelay();
+      if (!port) {
+        routeNative(message);
+        return;
+      }
       calls.set(message.id, port);
-      port.onMessage.addListener((reply) => {
-        window.postMessage({ channel, direction: 'extension', ...reply }, window.location.origin);
-        if (['route', 'response-end', 'error'].includes(reply.type)) {
+      try {
+        port.onMessage.addListener((reply) => {
+          window.postMessage({ channel, direction: 'extension', ...reply }, window.location.origin);
+          if (['route', 'response-end', 'error'].includes(reply.type)) {
+            calls.delete(message.id);
+            disconnectProviderPort(port);
+          }
+        });
+        port.onDisconnect.addListener(() => {
+          if (!calls.delete(message.id)) return;
+          window.postMessage({
+            channel,
+            direction: 'extension',
+            type: 'error',
+            id: message.id,
+          }, window.location.origin);
+        });
+      } catch {
           calls.delete(message.id);
-          port.disconnect();
-        }
-      });
-      port.onDisconnect.addListener(() => calls.delete(message.id));
-      port.postMessage(message);
+        disconnectProviderPort(port);
+        routeNative(message);
+        return;
+      }
+      if (!postProviderMessage(port, message)) {
+        calls.delete(message.id);
+        disconnectProviderPort(port);
+        routeNative(message);
+      }
       return;
     }
 
     const port = calls.get(message.id);
     if (!port) return;
-    if (message.type === 'ack') port.postMessage(message);
+    if (message.type === 'ack') postProviderMessage(port, message);
     if (message.type === 'cancel') {
-      port.postMessage(message);
+      postProviderMessage(port, message);
       calls.delete(message.id);
-      port.disconnect();
+      disconnectProviderPort(port);
     }
   });
 })();

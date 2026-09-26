@@ -17,6 +17,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
   const temporaryDirectory = await mkdtemp(join(tmpdir(), 'browser-ai-connector-'));
   const key = 'sk-test-registered-credential';
   const apiRequests = [];
+  const tokenRequests = [];
   const workerScriptRequests = [];
   const browserConnections = [];
   let chrome;
@@ -37,7 +38,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
     'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
     '-keyout', keyPath, '-out', certificatePath,
     '-subj', '/CN=api.openai.com',
-    '-addext', 'subjectAltName=DNS:api.openai.com,DNS:api.anthropic.com,DNS:generativelanguage.googleapis.com',
+    '-addext', 'subjectAltName=DNS:api.openai.com,DNS:api.anthropic.com,DNS:generativelanguage.googleapis.com,DNS:apihub.agnes-ai.com,DNS:source-resource.openai.azure.com,DNS:target-resource.openai.azure.com',
   ], { stdio: 'ignore' });
   assert.equal(certificateResult.status, 0, 'openssl must create the mock API certificate');
 
@@ -97,16 +98,18 @@ test('page fetch uses the credential assigned to its page origin without exposin
     }
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
+    const requestBody = Buffer.concat(chunks).toString('utf8');
     let markClosed;
     const record = {
       host: request.headers.host,
       authorization: request.headers.authorization,
       apiKey: request.headers['x-api-key'],
+      azureApiKey: request.headers['api-key'],
       googleApiKey: request.headers['x-goog-api-key'],
       anthropicVersion: request.headers['anthropic-version'],
       method: request.method,
       path: request.url,
-      body: Buffer.concat(chunks).toString('utf8'),
+      body: requestBody,
       completed: false,
       cancelled: false,
       closed: new Promise((resolveClosed) => { markClosed = resolveClosed; }),
@@ -160,7 +163,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
   chrome = spawn(chromeExecutable, [
     '--headless=new', '--no-sandbox', '--disable-gpu', '--no-first-run',
     '--no-default-browser-check', '--ignore-certificate-errors',
-    '--host-resolver-rules=MAP api.openai.com 127.0.0.1, MAP api.anthropic.com 127.0.0.1, MAP generativelanguage.googleapis.com 127.0.0.1',
+    '--host-resolver-rules=MAP api.openai.com 127.0.0.1, MAP api.anthropic.com 127.0.0.1, MAP generativelanguage.googleapis.com 127.0.0.1, MAP apihub.agnes-ai.com 127.0.0.1, MAP source-resource.openai.azure.com 127.0.0.1, MAP target-resource.openai.azure.com 127.0.0.1',
     '--remote-debugging-port=0', `--user-data-dir=${profileDirectory}`,
     `--disable-extensions-except=${root}`, `--load-extension=${root}`,
     'about:blank',
@@ -185,6 +188,27 @@ test('page fetch uses the credential assigned to its page origin without exposin
     ));
     return extensionTarget?.url.match(/^chrome-extension:\/\/([^/]+)/)?.[1];
   });
+
+  const { targetInfos } = await browserConnection.send('Target.getTargets');
+  const serviceWorkerTarget = targetInfos.find((target) => target.type === 'service_worker' && target.url.endsWith('/src/background.js'));
+  const { sessionId: serviceWorkerSession } = await browserConnection.send('Target.attachToTarget', {
+    targetId: serviceWorkerTarget.targetId,
+    flatten: true,
+  });
+  browserConnection.onEvent('Fetch.requestPaused', (params, sessionId) => {
+    if (sessionId !== serviceWorkerSession || !params.request.url.startsWith('https://login.microsoftonline.com/')) return;
+    const tokenUrl = new URL(params.request.url);
+    tokenRequests.push({ path: tokenUrl.pathname, body: params.request.postData, authorization: params.request.headers.Authorization });
+    void browserConnection.send('Fetch.fulfillRequest', {
+      requestId: params.requestId,
+      responseCode: 200,
+      responseHeaders: [{ name: 'content-type', value: 'application/json' }],
+      body: Buffer.from(JSON.stringify({ access_token: 'mock-entra-access-token', expires_in: 3600, token_type: 'Bearer' })).toString('base64'),
+    }, serviceWorkerSession);
+  });
+  await browserConnection.send('Fetch.enable', {
+    patterns: [{ urlPattern: 'https://login.microsoftonline.com/*', requestStage: 'Request' }],
+  }, serviceWorkerSession);
 
   const options = await openPage(browserConnection, `chrome-extension://${extensionId}/options.html`);
   browserConnections.push(options.connection);
@@ -222,6 +246,11 @@ test('page fetch uses the credential assigned to its page origin without exposin
   assert.deepEqual(JSON.parse(apiRequests[0].body), payload);
   assert.equal(pageResult.observed.includes(key), false);
   assert.equal(pageResult.storage.includes(key), false);
+  await options.waitUntil('document.querySelector("#request-logs")?.textContent.includes("HTTP 200")');
+  const requestLogText = await options.evaluate('document.querySelector("#request-logs").textContent');
+  assert.match(requestLogText, /OpenAI · POST https:\/\/api\.openai\.com:\d+\/v1\/chat\/completions/);
+  assert.equal(requestLogText.includes(key), false);
+  assert.equal(requestLogText.includes('Keep this payload unchanged.'), false);
 
   const replacementKey = 'sk-test-replacement-credential';
   await saveAssignment(options, siteOrigin, replacementKey);
@@ -550,6 +579,133 @@ test('page fetch uses the credential assigned to its page origin without exposin
   assert.equal(unmatchedGoogleRecord.googleApiKey, 'page-placeholder');
   assert.deepEqual(JSON.parse(unmatchedGoogleRecord.body), googlePayload);
 
+  const agnesKey = 'agnes-test-registered-key';
+  await saveAssignment(options, siteOrigin, agnesKey, 'agnes');
+  const agnesResult = await page.evaluate(`(async () => {
+    const response = await fetch('https://apihub.agnes-ai.com:${apiPort}/v1/chat/completions', {
+      method: 'POST',
+      headers: { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'agnes-2.5-flash', messages: [{ role: 'user', content: 'Agnes test' }] }),
+    });
+    return { status: response.status, body: await response.json() };
+  })()`);
+  assert.equal(agnesResult.status, 200);
+  const agnesRecord = [...apiRequests].reverse().find((request) => request.host.startsWith('apihub.agnes-ai.com'));
+  assert.equal(agnesRecord.authorization, `Bearer ${agnesKey}`);
+  assert.equal(agnesRecord.path, '/v1/chat/completions');
+  assert.deepEqual(JSON.parse(agnesRecord.body).messages[0], { role: 'user', content: 'Agnes test' });
+
+  const customProviderKey = 'custom-provider-test-key';
+  await saveCustomAssignment(options, siteOrigin, customProviderKey, {
+    name: 'Custom SDK Provider',
+    endpoint: `https://api.openai.com:${apiPort}/v1/custom-sdk`,
+    authMode: 'header',
+    headerName: 'x-api-key',
+    headerPrefix: 'Token ',
+  });
+  const customProviderResult = await page.evaluate(`(async () => {
+    const response = await fetch('https://api.openai.com:${apiPort}/v1/custom-sdk/chat/completions', {
+      method: 'POST',
+      headers: { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
+      body: JSON.stringify({ model: 'mistral-test', messages: [{ role: 'user', content: 'Custom provider' }] }),
+    });
+    return { status: response.status, body: await response.json() };
+  })()`);
+  assert.equal(customProviderResult.status, 200);
+  const customProviderRecord = [...apiRequests].reverse().find((request) => request.path === '/v1/custom-sdk/chat/completions');
+  assert.equal(customProviderRecord.apiKey, `Token ${customProviderKey}`);
+  assert.equal(customProviderRecord.authorization, undefined);
+  assert.match(await options.evaluate('document.querySelector("#assignments").textContent'), /Custom SDK Provider/);
+
+  await saveCustomAssignment(options, siteOrigin, 'custom-query-key', {
+    name: 'Query Auth Provider',
+    endpoint: `https://api.openai.com:${apiPort}/v1/query-provider`,
+    authMode: 'query',
+    queryParam: 'api_key',
+  });
+  await page.evaluate(`fetch('https://api.openai.com:${apiPort}/v1/query-provider/generate', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'query-test' }),
+  })`);
+  const queryProviderRecord = [...apiRequests].reverse().find((request) => request.path.startsWith('/v1/query-provider/generate'));
+  assert.equal(new URL(`https://mock${queryProviderRecord.path}`).searchParams.get('api_key'), 'custom-query-key');
+
+  const azureEndpoint = `https://target-resource.openai.azure.com:${apiPort}`;
+  const azurePayload = { model: 'deployment-test', messages: [{ role: 'user', content: 'Azure test' }] };
+  await saveAzureAssignment(options, siteOrigin, {
+    endpoint: azureEndpoint,
+    authMode: 'api-key',
+    apiKey: 'azure-api-key-test',
+  });
+  const azureKeyResult = await page.evaluate(`(async () => {
+    const response = await fetch('https://source-resource.openai.azure.com:${apiPort}/openai/deployments/deployment-test/chat/completions?api-version=2024-10-21', {
+      method: 'POST',
+      headers: { 'api-key': 'page-placeholder', 'content-type': 'application/json' },
+      body: ${JSON.stringify(JSON.stringify(azurePayload))},
+    });
+    return { status: response.status, body: await response.json() };
+  })()`);
+  assert.equal(azureKeyResult.status, 200);
+  const azureKeyRecord = [...apiRequests].reverse().find((request) => request.host.startsWith('target-resource.openai.azure.com'));
+  assert.equal(azureKeyRecord.azureApiKey, 'azure-api-key-test');
+  assert.equal(azureKeyRecord.path, '/openai/deployments/deployment-test/chat/completions?api-version=2024-10-21');
+  assert.deepEqual(JSON.parse(azureKeyRecord.body), azurePayload);
+
+  const entraSecret = 'entra-client-secret-test';
+  await saveAzureAssignment(options, siteOrigin, {
+    endpoint: azureEndpoint,
+    authMode: 'entra',
+    tenantId: 'tenant-test-id',
+    clientId: 'client-test-id',
+    clientSecret: entraSecret,
+  });
+  const entraResult = await page.evaluate(`(async () => {
+    try {
+      const response = await fetch('https://source-resource.openai.azure.com:${apiPort}/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
+        body: ${JSON.stringify(JSON.stringify(azurePayload))},
+      });
+      return { status: response.status, body: await response.json(),
+        messages: JSON.stringify(window.__observedMessages ?? []),
+        storage: JSON.stringify([localStorage, sessionStorage]) };
+    } catch (error) { return { error: error.message }; }
+  })()`);
+  assert.equal(entraResult.status, 200, JSON.stringify({ entraResult, tokenRequests, apiRequests }));
+  const entraAzureRecord = [...apiRequests].reverse().find((request) => request.path === '/openai/v1/chat/completions');
+  assert.equal(entraAzureRecord.authorization, 'Bearer mock-entra-access-token');
+  assert.equal(entraAzureRecord.azureApiKey, undefined);
+  assert.ok(tokenRequests.length >= 1);
+  assert.ok(tokenRequests.every((request) => (
+    request.path === '/tenant-test-id/oauth2/v2.0/token'
+      && request.body.includes('client_id=client-test-id')
+      && request.body.includes('grant_type=client_credentials')
+      && request.body.includes('scope=https%3A%2F%2Fcognitiveservices.azure.com%2F.default')
+      && request.authorization === undefined
+  )));
+  assert.equal(entraResult.messages.includes(entraSecret), false);
+  assert.equal(entraResult.storage.includes(entraSecret), false);
+  assert.equal(await options.evaluate(`chrome.storage.local.get('azureAssignments')
+    .then((value) => JSON.stringify(value.azureAssignments).includes(${JSON.stringify(entraSecret)}))`), true);
+
+  const azureWorkerResult = await workerFetch(
+    page,
+    `https://source-resource.openai.azure.com:${apiPort}/openai/v1/chat/completions`,
+    azurePayload,
+    { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
+  );
+  assert.equal(azureWorkerResult.status, 200);
+  const azureWorkerRecord = [...apiRequests].reverse().find((request) => (
+    request.path === '/openai/v1/chat/completions' && JSON.parse(request.body).model === azurePayload.model
+  ));
+  assert.equal(azureWorkerRecord.authorization, 'Bearer mock-entra-access-token');
+  assert.ok(tokenRequests.length >= 1);
+  assert.ok(tokenRequests.every((request) => (
+    request.path === '/tenant-test-id/oauth2/v2.0/token'
+      && request.body.includes('client_id=client-test-id')
+      && request.body.includes('grant_type=client_credentials')
+      && request.body.includes('scope=https%3A%2F%2Fcognitiveservices.azure.com%2F.default')
+  )));
+
   const workerPayload = {
     model: 'gpt-test-2026-09',
     messages: [{ role: 'user', content: 'Preserve this worker payload.' }],
@@ -567,7 +723,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
   } catch (error) {
     throw new Error(`${error.message}; worker scripts fetched: ${workerScriptRequests.length}`);
   }
-  assert.equal(workerScriptRequests.length, 1);
+  assert.ok(workerScriptRequests.length >= 2);
   assert.equal(workerResult.status, 200);
   assert.match(workerResult.firstChunk, /first-stream-chunk/);
   assert.ok(workerResult.elapsed < 2000, `first worker stream chunk took ${workerResult.elapsed}ms`);
@@ -660,8 +816,26 @@ test('page fetch uses the credential assigned to its page origin without exposin
   assert.equal(workerGoogleRecord.path, '/v1beta/models/gemini-test-2026:generateContent');
   assert.deepEqual(JSON.parse(workerGoogleRecord.body), workerGooglePayload);
 
-  const workerCredentials = [key, replacementKey, anthropicKey, replacementAnthropicKey, googleKey];
-  const workerResults = [workerResult, workerAnthropicResult, workerGoogleResult];
+  const customWorkerPayload = {
+    model: 'mistral-test',
+    messages: [{ role: 'user', content: 'Preserve this custom provider worker payload.' }],
+  };
+  const customWorkerResult = await workerFetch(
+    page,
+    `https://api.openai.com:${apiPort}/v1/custom-sdk/chat/completions`,
+    customWorkerPayload,
+    { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
+  );
+  assert.equal(customWorkerResult.status, 200);
+  const customWorkerRecord = [...apiRequests].reverse()
+    .find((request) => request.path === '/v1/custom-sdk/chat/completions'
+      && JSON.parse(request.body).messages[0].content === customWorkerPayload.messages[0].content);
+  assert.equal(customWorkerRecord.apiKey, `Token ${customProviderKey}`);
+  assert.equal(customWorkerRecord.authorization, undefined);
+  assert.deepEqual(JSON.parse(customWorkerRecord.body), customWorkerPayload);
+
+  const workerCredentials = [key, replacementKey, anthropicKey, replacementAnthropicKey, googleKey, agnesKey, customProviderKey, entraSecret, 'mock-entra-access-token'];
+  const workerResults = [workerResult, workerAnthropicResult, workerGoogleResult, customWorkerResult, azureWorkerResult];
   const observedWorkerMessages = JSON.stringify(await page.evaluate('window.__workerObservedMessages ?? []'));
   for (const credential of workerCredentials) {
     assert.equal(JSON.stringify(workerResults).includes(credential), false);
@@ -813,8 +987,48 @@ async function openPage(browser, url) {
 async function saveAssignment(options, origin, key, provider = 'openai') {
   await options.evaluate(`(() => {
     const providerSelect = document.querySelector('#provider');
-    if (providerSelect) providerSelect.value = ${JSON.stringify(provider)};
+    if (providerSelect) {
+      providerSelect.value = ${JSON.stringify(provider)};
+      providerSelect.dispatchEvent(new Event('change'));
+    }
     document.querySelector('#origin').value = ${JSON.stringify(origin)};
+    document.querySelector('#api-key').value = ${JSON.stringify(key)};
+    document.querySelector('#save-assignment').click();
+  })()`);
+  await options.waitUntil('document.querySelector("#status").textContent === "Assignment saved."');
+}
+
+async function saveAzureAssignment(options, origin, assignment) {
+  await options.evaluate(`(() => {
+    const providerSelect = document.querySelector('#provider');
+    providerSelect.value = 'azure';
+    providerSelect.dispatchEvent(new Event('change'));
+    document.querySelector('#origin').value = ${JSON.stringify(origin)};
+    document.querySelector('#azure-endpoint').value = ${JSON.stringify(assignment.endpoint)};
+    document.querySelector('#azure-auth').value = ${JSON.stringify(assignment.authMode)};
+    document.querySelector('#azure-auth').dispatchEvent(new Event('change'));
+    document.querySelector('#api-key').value = ${JSON.stringify(assignment.apiKey ?? '')};
+    document.querySelector('#tenant-id').value = ${JSON.stringify(assignment.tenantId ?? '')};
+    document.querySelector('#client-id').value = ${JSON.stringify(assignment.clientId ?? '')};
+    document.querySelector('#client-secret').value = ${JSON.stringify(assignment.clientSecret ?? '')};
+    document.querySelector('#save-assignment').click();
+  })()`);
+  await options.waitUntil('document.querySelector("#status").textContent === "Assignment saved."');
+}
+
+async function saveCustomAssignment(options, origin, key, assignment) {
+  await options.evaluate(`(() => {
+    const providerSelect = document.querySelector('#provider');
+    providerSelect.value = 'custom';
+    providerSelect.dispatchEvent(new Event('change'));
+    document.querySelector('#origin').value = ${JSON.stringify(origin)};
+    document.querySelector('#custom-name').value = ${JSON.stringify(assignment.name)};
+    document.querySelector('#custom-endpoint').value = ${JSON.stringify(assignment.endpoint)};
+    document.querySelector('#custom-auth-mode').value = ${JSON.stringify(assignment.authMode)};
+    document.querySelector('#custom-auth-mode').dispatchEvent(new Event('change'));
+    document.querySelector('#custom-header-name').value = ${JSON.stringify(assignment.headerName ?? '')};
+    document.querySelector('#custom-header-prefix').value = ${JSON.stringify(assignment.headerPrefix ?? '')};
+    document.querySelector('#custom-query-param').value = ${JSON.stringify(assignment.queryParam ?? '')};
     document.querySelector('#api-key').value = ${JSON.stringify(key)};
     document.querySelector('#save-assignment').click();
   })()`);
@@ -965,9 +1179,15 @@ class CdpConnection {
     this.socket = socket;
     this.nextId = 0;
     this.pending = new Map();
+    this.listeners = new Map();
     socket.addEventListener('message', (event) => {
       const message = JSON.parse(event.data);
-      if (!message.id) return;
+      if (!message.id) {
+        for (const listener of this.listeners.get(message.method) ?? []) {
+          listener(message.params, message.sessionId);
+        }
+        return;
+      }
       const pending = this.pending.get(message.id);
       if (!pending) return;
       this.pending.delete(message.id);
@@ -991,6 +1211,12 @@ class CdpConnection {
       this.pending.set(id, { resolve: resolveMessage, reject: rejectMessage });
       this.socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
     });
+  }
+
+  onEvent(method, listener) {
+    const listeners = this.listeners.get(method) ?? [];
+    listeners.push(listener);
+    this.listeners.set(method, listeners);
   }
 
   close() {

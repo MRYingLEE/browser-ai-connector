@@ -20,11 +20,59 @@
           <option value="openai">OpenAI</option>
           <option value="anthropic">Anthropic</option>
           <option value="google">Google AI</option>
+          <option value="agnes">Agnes</option>
+          <option value="azure">Azure OpenAI</option>
+          <option value="custom">Custom provider</option>
         </select>
+        <p id="provider-help" class="help"></p>
+        <div id="custom-fields" hidden>
+          <label for="custom-name">Provider name</label>
+          <input id="custom-name" name="custom-name" type="text" maxlength="80" placeholder="Mistral">
+          <label for="custom-endpoint">Provider API base URL</label>
+          <input id="custom-endpoint" name="custom-endpoint" type="url" placeholder="https://api.mistral.ai/v1">
+          <p class="help">Enter the API base URL used by the application. Requests below this path will be routed without changing their payload or path. Saving requests access to this host.</p>
+          <label for="custom-auth-mode">Credential format</label>
+          <select id="custom-auth-mode" name="custom-auth-mode">
+            <option value="bearer">Bearer token</option>
+            <option value="header">Custom header</option>
+            <option value="query">Query parameter</option>
+          </select>
+          <div id="custom-header-fields" hidden>
+            <label for="custom-header-name">Credential header</label>
+            <input id="custom-header-name" name="custom-header-name" type="text" value="x-api-key" autocomplete="off">
+            <label for="custom-header-prefix">Header value prefix</label>
+            <input id="custom-header-prefix" name="custom-header-prefix" type="text" value="" autocomplete="off" placeholder="Leave blank for a raw key">
+          </div>
+          <div id="custom-query-fields" hidden>
+            <label for="custom-query-param">Credential query parameter</label>
+            <input id="custom-query-param" name="custom-query-param" type="text" value="key" autocomplete="off">
+          </div>
+        </div>
         <label for="origin">Page origin</label>
-        <input id="origin" name="origin" type="url" placeholder="https://notebook.example" required>
+        <input id="origin" name="origin" type="url" placeholder="https://notebook.example" aria-describedby="origin-help" required>
+        <p id="origin-help" class="help">The exact HTTPS origin of the application tab that makes the AI request, with no path. Localhost HTTP is allowed for development.</p>
+        <div id="azure-fields" hidden>
+          <label for="azure-endpoint">Azure OpenAI resource URL</label>
+          <input id="azure-endpoint" name="endpoint" type="url" placeholder="https://my-resource.openai.azure.com">
+          <p class="help">Use the resource host only, without /openai, a deployment, or a query string. The request's deployment path and api-version are preserved.</p>
+          <label for="azure-auth">Authentication</label>
+          <select id="azure-auth" name="auth-mode">
+            <option value="api-key">Azure API key</option>
+            <option value="entra">Microsoft Entra ID app credentials</option>
+          </select>
+        </div>
         <label id="api-key-label" for="api-key">OpenAI API key</label>
         <input id="api-key" name="api-key" type="password" autocomplete="new-password" required>
+        <div id="entra-fields" hidden>
+          <label for="tenant-id">Microsoft Entra tenant ID</label>
+          <input id="tenant-id" name="tenant-id" autocomplete="off">
+          <label for="client-id">Application (client) ID</label>
+          <input id="client-id" name="client-id" autocomplete="off">
+          <label for="client-secret">Client secret value</label>
+          <input id="client-secret" name="client-secret" type="password" autocomplete="new-password">
+          <p class="help">Use an app registration's tenant ID, application (client) ID, and the client secret value (not its secret ID). Assign that app the Cognitive Services OpenAI User role on this Azure OpenAI resource. The extension requests the Cognitive Services .default scope from Microsoft's public-cloud token endpoint. The secret is stored in this browser profile; use only if your organization permits it.</p>
+        </div>
+        <p class="help">Credentials are stored only in this browser profile, are not shown again after saving, and are not protected by a secure vault. An authorized page can use its assigned provider credential through supported requests. Removing a credential blocks matching requests; removing the assignment restores the page's native network behavior.</p>
         <button id="save-assignment" type="submit">Save assignment</button>
         <p id="status" role="status" aria-live="polite"></p>
       </form>
@@ -32,6 +80,12 @@
       <section aria-labelledby="assignments-heading">
         <h2 id="assignments-heading">Credential assignments</h2>
         <div id="assignments" aria-live="polite"></div>
+      </section>
+
+      <section aria-labelledby="request-logs-heading">
+        <h2 id="request-logs-heading">Request activity</h2>
+        <p class="help">Latest 100 supported requests. Activity is held in memory and may clear if the extension service worker restarts.</p>
+        <ol id="request-logs" aria-live="off"></ol>
       </section>
     </main>
   </body>

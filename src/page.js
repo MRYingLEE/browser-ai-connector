@@ -1,9 +1,22 @@
 (() => {
   const channel = 'browser-ai-connector-v1';
   const openAiTextGenerationPaths = ['/v1/chat/completions', '/v1/completions', '/v1/responses'];
+  const azureOpenAiPath = /^\/openai\/(?:v1\/(?:chat\/completions|completions|responses)|deployments\/[^/]+\/(?:chat\/completions|completions))$/;
   const nativeFetch = window.fetch.bind(window);
   const pending = new Map();
   const workerBridges = new Map();
+  let customProviderEndpoints = [];
+
+  function isCustomProviderRequest(url, method, endpoints = customProviderEndpoints) {
+    if (String(method).toUpperCase() !== 'POST'
+      || (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)))) return false;
+    return endpoints.some((endpoint) => {
+      const base = new URL(endpoint);
+      const basePath = base.pathname.replace(/\/+$/, '');
+      return url.origin === base.origin
+        && (basePath === '' || url.pathname === basePath || url.pathname.startsWith(`${basePath}/`));
+    });
+  }
 
   function createWorker(workerUrl, options) {
     const targetUrl = new URL(workerUrl, window.location.href);
@@ -45,6 +58,8 @@
     const bootstrap = `(() => {
       const channel = new BroadcastChannel(${JSON.stringify(workerChannel)});
       const openAiTextGenerationPaths = ${JSON.stringify(openAiTextGenerationPaths)};
+      const azureOpenAiPath = ${azureOpenAiPath};
+      let customProviderEndpoints = ${JSON.stringify(customProviderEndpoints)};
       const nativeFetch = self.fetch.bind(self);
       const pending = new Map();
       let relayReady = false;
@@ -56,11 +71,25 @@
       });
 
       function supportedRequest(url, method) {
+        const isCustomProviderRequest = String(method).toUpperCase() === 'POST'
+          && (url.protocol === 'https:' || (url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname)))
+          && customProviderEndpoints.some((endpoint) => {
+            const base = new URL(endpoint);
+            let basePath = base.pathname;
+            while (basePath.endsWith('/')) basePath = basePath.slice(0, -1);
+            return url.origin === base.origin
+              && (basePath === '' || url.pathname === basePath || url.pathname.startsWith(basePath + '/'));
+          });
         return (method === 'POST' && url.protocol === 'https:' && url.hostname === 'api.openai.com'
           && openAiTextGenerationPaths.includes(url.pathname))
           || (method === 'POST' && url.protocol === 'https:' && url.hostname === 'api.anthropic.com' && url.pathname === '/v1/messages')
+          || (method === 'POST' && url.protocol === 'https:' && url.hostname === 'apihub.agnes-ai.com'
+            && openAiTextGenerationPaths.includes(url.pathname))
+          || (method === 'POST' && url.protocol === 'https:' && /^[a-z0-9-]+\\.openai\\.azure\\.com$/i.test(url.hostname)
+            && azureOpenAiPath.test(url.pathname))
           || (method === 'POST' && url.protocol === 'https:' && url.hostname === 'generativelanguage.googleapis.com'
-            && /^\\/v1(?:beta)?\\/models\\/[^/]+:(?:generateContent|streamGenerateContent)$/.test(url.pathname));
+            && /^\\/v1(?:beta)?\\/models\\/[^/]+:(?:generateContent|streamGenerateContent)$/.test(url.pathname))
+          || isCustomProviderRequest;
       }
 
       function finish(id) {
@@ -71,6 +100,10 @@
       }
 
       channel.addEventListener('message', ({ data: message }) => {
+        if (message?.type === 'custom-provider-endpoints' && Array.isArray(message.endpoints)) {
+          customProviderEndpoints = message.endpoints;
+          return;
+        }
         if (message?.type === 'ready') {
           if (!relayReady) {
             relayReady = true;
@@ -245,6 +278,13 @@
     if (event.source !== window || event.origin !== window.location.origin) return;
     const message = event.data;
     if (!message || message.channel !== channel) return;
+    if (message.type === 'custom-provider-endpoints' && Array.isArray(message.endpoints)) {
+      customProviderEndpoints = message.endpoints.filter((endpoint) => typeof endpoint === 'string');
+      for (const bridge of workerBridges.values()) {
+        bridge.channel.postMessage({ type: 'custom-provider-endpoints', endpoints: customProviderEndpoints });
+      }
+      return;
+    }
     if (message.type === 'worker-connected') {
       const bridge = workerBridges.get(message.workerChannel);
       if (!bridge || bridge.connected) return;
@@ -344,11 +384,20 @@
       && requestUrl.protocol === 'https:'
       && requestUrl.hostname === 'api.anthropic.com'
       && requestUrl.pathname === '/v1/messages';
+    const isAgnesRequest = request.method === 'POST'
+      && requestUrl.protocol === 'https:'
+      && requestUrl.hostname === 'apihub.agnes-ai.com'
+      && openAiTextGenerationPaths.includes(requestUrl.pathname);
+    const isAzureRequest = request.method === 'POST'
+      && requestUrl.protocol === 'https:'
+      && /^[a-z0-9-]+\.openai\.azure\.com$/i.test(requestUrl.hostname)
+      && azureOpenAiPath.test(requestUrl.pathname);
     const isGoogleRequest = request.method === 'POST'
       && requestUrl.protocol === 'https:'
       && requestUrl.hostname === 'generativelanguage.googleapis.com'
       && /^\/v1(?:beta)?\/models\/[^/]+:(?:generateContent|streamGenerateContent)$/.test(requestUrl.pathname);
-    if (!isOpenAiRequest && !isAnthropicRequest && !isGoogleRequest) {
+    const isCustomRequest = isCustomProviderRequest(requestUrl, request.method);
+    if (!isOpenAiRequest && !isAnthropicRequest && !isGoogleRequest && !isAgnesRequest && !isAzureRequest && !isCustomRequest) {
       return nativeFetch(request);
     }
 
