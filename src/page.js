@@ -1,5 +1,6 @@
 (() => {
   const channel = 'browser-ai-connector-v1';
+  const openAiTextGenerationPaths = ['/v1/chat/completions', '/v1/completions', '/v1/responses'];
   const nativeFetch = window.fetch.bind(window);
   const pending = new Map();
   const workerBridges = new Map();
@@ -43,6 +44,7 @@
     });
     const bootstrap = `(() => {
       const channel = new BroadcastChannel(${JSON.stringify(workerChannel)});
+      const openAiTextGenerationPaths = ${JSON.stringify(openAiTextGenerationPaths)};
       const nativeFetch = self.fetch.bind(self);
       const pending = new Map();
       let relayReady = false;
@@ -53,10 +55,11 @@
         readyTimer = setTimeout(() => resolve(false), 1000);
       });
 
-      function supportedRequest(url) {
-        return (url.protocol === 'https:' && url.hostname === 'api.openai.com' && url.pathname.startsWith('/v1/'))
-          || (url.protocol === 'https:' && url.hostname === 'api.anthropic.com' && url.pathname === '/v1/messages')
-          || (url.protocol === 'https:' && url.hostname === 'generativelanguage.googleapis.com'
+      function supportedRequest(url, method) {
+        return (method === 'POST' && url.protocol === 'https:' && url.hostname === 'api.openai.com'
+          && openAiTextGenerationPaths.includes(url.pathname))
+          || (method === 'POST' && url.protocol === 'https:' && url.hostname === 'api.anthropic.com' && url.pathname === '/v1/messages')
+          || (method === 'POST' && url.protocol === 'https:' && url.hostname === 'generativelanguage.googleapis.com'
             && /^\\/v1(?:beta)?\\/models\\/[^/]+:(?:generateContent|streamGenerateContent)$/.test(url.pathname));
       }
 
@@ -131,7 +134,7 @@
           return Promise.reject(error);
         }
         const requestUrl = new URL(request.url);
-        if (!relayReady || !supportedRequest(requestUrl)) return nativeFetch(request);
+        if (!supportedRequest(requestUrl, request.method)) return nativeFetch(request);
 
         const id = crypto.randomUUID();
         let resolveRequest;
@@ -333,13 +336,16 @@
     }
 
     const requestUrl = new URL(request.url);
-    const isOpenAiRequest = requestUrl.protocol === 'https:'
+    const isOpenAiRequest = request.method === 'POST'
+      && requestUrl.protocol === 'https:'
       && requestUrl.hostname === 'api.openai.com'
-      && requestUrl.pathname.startsWith('/v1/');
-    const isAnthropicRequest = requestUrl.protocol === 'https:'
+      && openAiTextGenerationPaths.includes(requestUrl.pathname);
+    const isAnthropicRequest = request.method === 'POST'
+      && requestUrl.protocol === 'https:'
       && requestUrl.hostname === 'api.anthropic.com'
       && requestUrl.pathname === '/v1/messages';
-    const isGoogleRequest = requestUrl.protocol === 'https:'
+    const isGoogleRequest = request.method === 'POST'
+      && requestUrl.protocol === 'https:'
       && requestUrl.hostname === 'generativelanguage.googleapis.com'
       && /^\/v1(?:beta)?\/models\/[^/]+:(?:generateContent|streamGenerateContent)$/.test(requestUrl.pathname);
     if (!isOpenAiRequest && !isAnthropicRequest && !isGoogleRequest) {

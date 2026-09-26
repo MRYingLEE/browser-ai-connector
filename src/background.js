@@ -3,6 +3,11 @@ const assignmentStorageKeys = {
   anthropic: 'anthropicAssignments',
   google: 'googleAssignments',
 };
+const openAiTextGenerationPaths = new Set([
+  '/v1/chat/completions',
+  '/v1/completions',
+  '/v1/responses',
+]);
 const maximumRequestBytes = 8 * 1024 * 1024;
 
 chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage());
@@ -93,7 +98,7 @@ function validateProvider(value) {
 async function relayRequest(port, message, call, calls) {
   const senderOrigin = new URL(port.sender.url).origin;
   const requestUrl = new URL(message.url);
-  const provider = providerForRequest(requestUrl);
+  const provider = providerForRequest(requestUrl, message.method);
   if (!provider) {
     port.postMessage({ type: 'route', id: message.id, route: 'native' });
     calls.delete(message.id);
@@ -165,9 +170,9 @@ async function relayRequest(port, message, call, calls) {
   }
 }
 
-function providerForRequest(url) {
-  if (url.protocol !== 'https:') return null;
-  if (url.hostname === 'api.openai.com' && url.pathname.startsWith('/v1/')) return 'openai';
+function providerForRequest(url, method) {
+  if (url.protocol !== 'https:' || String(method).toUpperCase() !== 'POST') return null;
+  if (url.hostname === 'api.openai.com' && openAiTextGenerationPaths.has(url.pathname)) return 'openai';
   if (url.hostname === 'api.anthropic.com' && url.pathname === '/v1/messages') return 'anthropic';
   if (url.hostname === 'generativelanguage.googleapis.com'
     && /^\/v1(?:beta)?\/models\/[^/]+:(?:generateContent|streamGenerateContent)$/.test(url.pathname)) return 'google';

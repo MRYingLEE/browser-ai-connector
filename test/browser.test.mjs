@@ -117,7 +117,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
       && JSON.parse(record.body).stream === true;
     const isGoogleStream = request.headers.host.startsWith('generativelanguage.googleapis.com')
       && request.url.startsWith('/v1beta/models/gemini-test-2026:streamGenerateContent');
-    if (request.url === '/v1/stream' || isAnthropicStream || isGoogleStream) {
+    if (request.url.startsWith('/v1/chat/completions?mock=stream') || isAnthropicStream || isGoogleStream) {
       response.writeHead(200, { 'content-type': 'text/event-stream' });
       response.flushHeaders();
       response.write(isAnthropicStream
@@ -232,7 +232,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
 
   const streamResult = await page.evaluate(`(async () => {
     const started = performance.now();
-    const response = await fetch('https://api.openai.com:${apiPort}/v1/stream', {
+    const response = await fetch('https://api.openai.com:${apiPort}/v1/chat/completions?mock=stream', {
       method: 'POST',
       headers: { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
       body: ${JSON.stringify(JSON.stringify(payload))},
@@ -247,7 +247,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
   assert.equal(streamResult.status, 200);
   assert.match(streamResult.firstChunk, /first-stream-chunk/);
   assert.ok(streamResult.elapsed < 2000, `first stream chunk took ${streamResult.elapsed}ms`);
-  const streamRecord = apiRequests.find((request) => request.path === '/v1/stream');
+  const streamRecord = apiRequests.find((request) => request.path.startsWith('/v1/chat/completions?mock=stream'));
   assert.equal(streamRecord.authorization, `Bearer ${replacementKey}`);
   await waitFor(() => streamRecord.cancelled);
   assert.equal(streamRecord.completed, false);
@@ -259,7 +259,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
         setTimeout(() => controller.close(), 200);
       },
     });
-    const request = fetch('https://api.openai.com:${apiPort}/v1/abort-during-body', {
+    const request = fetch('https://api.openai.com:${apiPort}/v1/chat/completions?mock=abort-during-body', {
       method: 'POST',
       headers: { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
       body: delayedBody,
@@ -276,7 +276,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
   })()`);
   assert.equal(abortedBodyResult, 'AbortError');
   await delay(300);
-  assert.equal(apiRequests.some((request) => request.path === '/v1/abort-during-body'), false);
+  assert.equal(apiRequests.some((request) => request.path.startsWith('/v1/chat/completions?mock=abort-during-body')), false);
 
   const otherOrigin = process.env.JUPYTERLITE_URL
     ? `http://localhost:${siteServer.address().port}`
@@ -323,6 +323,19 @@ test('page fetch uses the credential assigned to its page origin without exposin
   const openAiAfterProviderAddition = await pageOpenAiFetch(page, apiPort, payload);
   assert.equal(openAiAfterProviderAddition.status, 200);
   assert.equal(apiRequests.at(-1).authorization, `Bearer ${replacementKey}`);
+
+  const nonGenerationResult = await page.evaluate(`(async () => {
+    const response = await fetch('https://api.openai.com:${apiPort}/v1/files', {
+      method: 'POST',
+      headers: { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
+      body: '{}',
+    });
+    return { status: response.status };
+  })()`);
+  const nonGenerationRecord = apiRequests.at(-1);
+  assert.equal(nonGenerationResult.status, 200);
+  assert.equal(nonGenerationRecord.path, '/v1/files');
+  assert.equal(nonGenerationRecord.authorization, 'Bearer page-placeholder');
 
   const anthropicKey = 'sk-ant-test-registered-credential';
   const anthropicPayload = {
@@ -545,7 +558,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
   try {
     workerResult = await workerFetch(
       page,
-      `https://api.openai.com:${apiPort}/v1/stream`,
+      `https://api.openai.com:${apiPort}/v1/chat/completions?mock=stream`,
       workerPayload,
       { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
       true,
@@ -562,12 +575,47 @@ test('page fetch uses the credential assigned to its page origin without exposin
   assert.equal(workerResult.chrome, 'undefined');
   assert.equal(JSON.stringify(workerResult).includes(key), false);
   const workerRecord = [...apiRequests].reverse().find((request) => (
-    request.path === '/v1/stream' && JSON.parse(request.body).messages[0].content === workerPayload.messages[0].content
+    request.path.startsWith('/v1/chat/completions?mock=stream') && JSON.parse(request.body).messages[0].content === workerPayload.messages[0].content
   ));
   assert.equal(workerRecord.authorization, `Bearer ${replacementKey}`);
   assert.deepEqual(JSON.parse(workerRecord.body), workerPayload);
   await waitFor(() => workerRecord.cancelled);
   assert.equal(workerRecord.completed, false);
+
+  await clickAssignmentAction(options, siteOrigin, 'openai', 'remove-assignment');
+  await options.waitUntil(`![...document.querySelectorAll('[data-provider]')]
+    .some((entry) => entry.dataset.origin === ${JSON.stringify(siteOrigin)}
+      && entry.dataset.provider === 'openai')`);
+  const unmatchedWorkerAfterHandshakeTimeout = await workerFetch(
+    page,
+    `https://api.openai.com:${apiPort}/v1/chat/completions?mock=stream`,
+    workerPayload,
+    { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
+    true,
+    false,
+    true,
+  );
+  assert.equal(unmatchedWorkerAfterHandshakeTimeout.status, 200);
+  assert.equal(apiRequests.at(-1).authorization, 'Bearer page-placeholder');
+
+  await saveAssignment(options, siteOrigin, replacementKey, 'openai');
+  await clickAssignmentAction(options, siteOrigin, 'openai', 'remove-key');
+  await options.waitUntil(`[...document.querySelectorAll('[data-provider]')]
+    .find((entry) => entry.dataset.origin === ${JSON.stringify(siteOrigin)}
+      && entry.dataset.provider === 'openai')?.textContent.includes('No key stored')`);
+  const requestsBeforeWorkerWithoutKey = apiRequests.length;
+  const workerWithoutKeyResult = await workerFetch(
+    page,
+    `https://api.openai.com:${apiPort}/v1/chat/completions?mock=stream`,
+    workerPayload,
+    { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
+    true,
+    false,
+    true,
+  );
+  assert.match(workerWithoutKeyResult.error, /credential is unavailable/i);
+  assert.equal(apiRequests.length, requestsBeforeWorkerWithoutKey);
+  await saveAssignment(options, siteOrigin, replacementKey, 'openai');
 
   const workerAnthropicPayload = {
     model: 'claude-test-2026-09',
@@ -626,26 +674,26 @@ test('page fetch uses the credential assigned to its page origin without exposin
   };
   const unintegratedResult = await workerFetch(
     page,
-    `https://api.openai.com:${apiPort}/v1/stream`,
+    `https://api.openai.com:${apiPort}/v1/chat/completions?mock=stream`,
     unintegratedPayload,
     { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
     false,
   );
   assert.equal(unintegratedResult.status, 200);
   const unintegratedRecord = [...apiRequests].reverse()
-    .find((request) => request.path === '/v1/stream'
+    .find((request) => request.path.startsWith('/v1/chat/completions?mock=stream')
       && JSON.parse(request.body).messages[0].content === unintegratedPayload.messages[0].content);
   assert.equal(unintegratedRecord.authorization, 'Bearer page-placeholder');
 
   const unmatchedWorkerResult = await workerFetch(
     otherPage,
-    `https://api.openai.com:${apiPort}/v1/stream`,
+    `https://api.openai.com:${apiPort}/v1/chat/completions?mock=stream`,
     workerPayload,
     { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
   );
   assert.equal(unmatchedWorkerResult.status, 200);
   const unmatchedWorkerRecord = [...apiRequests].reverse()
-    .find((request) => request.path === '/v1/stream'
+    .find((request) => request.path.startsWith('/v1/chat/completions?mock=stream')
       && JSON.parse(request.body).messages[0].content === workerPayload.messages[0].content);
   assert.equal(unmatchedWorkerRecord.authorization, 'Bearer page-placeholder');
   assert.deepEqual(JSON.parse(unmatchedWorkerRecord.body), workerPayload);
@@ -668,14 +716,14 @@ test('page fetch uses the credential assigned to its page origin without exposin
       reject(new Error(event.message));
     }, { once: true });
     worker.postMessage({
-      url: 'https://api.openai.com:${apiPort}/v1/stream',
+      url: 'https://api.openai.com:${apiPort}/v1/chat/completions?mock=stream',
       payload: ${JSON.stringify(terminatedPayload)},
       headers: { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
       terminateAfterResponse: true,
     });
   })`);
   const terminatedRecord = [...apiRequests].reverse()
-    .find((request) => request.path === '/v1/stream'
+    .find((request) => request.path.startsWith('/v1/chat/completions?mock=stream')
       && JSON.parse(request.body).messages[0].content === terminatedPayload.messages[0].content);
   await waitFor(() => terminatedRecord.cancelled);
   assert.equal(terminatedRecord.authorization, `Bearer ${replacementKey}`);
@@ -840,15 +888,26 @@ async function pageGoogleFetch(page, apiPort, payload, observeKey = false) {
   })()`);
 }
 
-async function workerFetch(page, url, payload, headers, integrated = true, observeMessages = false) {
+async function workerFetch(page, url, payload, headers, integrated = true, observeMessages = false, suppressWorkerConnect = false) {
   const observeWorkerMessages = observeMessages
     ? "window.__workerObservedMessages = []; addEventListener('message', (event) => window.__workerObservedMessages.push(event.data));"
+    : '';
+  const suppressWorkerConnectScript = suppressWorkerConnect
+    ? `const originalPostMessage = window.postMessage;
+      window.postMessage = function(message, ...arguments_) {
+        if (message?.channel === 'browser-ai-connector-v1' && message.type === 'worker-connect') return;
+        return originalPostMessage.call(this, message, ...arguments_);
+      };`
+    : '';
+  const restorePostMessageScript = suppressWorkerConnect
+    ? 'window.postMessage = originalPostMessage;'
     : '';
   const createWorker = integrated
     ? "window.BrowserAIConnector.createWorker(new URL('/dedicated-worker.js', location.href))"
     : "new Worker(new URL('/dedicated-worker.js', location.href))";
   return page.evaluate(`(async () => {
     ${observeWorkerMessages}
+    ${suppressWorkerConnectScript}
     const worker = ${createWorker};
     try {
       return await new Promise((resolve, reject) => {
@@ -869,6 +928,7 @@ async function workerFetch(page, url, payload, headers, integrated = true, obser
       });
     } finally {
       worker.terminate();
+      ${restorePostMessageScript}
     }
   })()`);
 }

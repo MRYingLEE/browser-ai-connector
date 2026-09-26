@@ -77,6 +77,7 @@
       return;
     }
     if (message.direction === 'worker') {
+      if (!workerBridges.has(message.workerChannel)) connectWorkerBridge(message.workerChannel);
       relayWorkerMessage(message.workerChannel, message);
       return;
     }

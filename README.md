@@ -1,6 +1,6 @@
 # Browser AI Connector
 
-Browser AI Connector is a Manifest V3 Chrome extension for using OpenAI, Anthropic, and Google AI credentials from page `fetch` calls without placing the registered key in page JavaScript. It supports `https://api.openai.com/v1/*`, Anthropic `POST https://api.anthropic.com/v1/messages`, and Google AI `POST` requests to the `v1` and `v1beta` `models/{model}:generateContent` and `:streamGenerateContent` endpoints on `generativelanguage.googleapis.com`. Google AI credentials are sent in the `x-goog-api-key` header, not the request URL.
+Browser AI Connector is a Manifest V3 Chrome extension for using OpenAI, Anthropic, and Google AI credentials from page `fetch` calls without placing the registered key in page JavaScript. It supports OpenAI `POST` requests to `/v1/chat/completions`, `/v1/completions`, and `/v1/responses`; Anthropic `POST https://api.anthropic.com/v1/messages`; and Google AI `POST` requests to the `v1` and `v1beta` `models/{model}:generateContent` and `:streamGenerateContent` endpoints on `generativelanguage.googleapis.com`. Google AI credentials are sent in the `x-goog-api-key` header, not the request URL.
 
 ## Install
 
