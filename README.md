@@ -13,6 +13,12 @@ Use HTTPS page origins. HTTP is accepted only for `localhost`, `127.0.0.1`, and 
 
 Unmatched requests keep the page's native network path. A matching request replaces the provider's credential header with the assigned key. The Anthropic `anthropic-version` header, model identifier, and request body are preserved. Response bodies stream to the page, and abort/cancel signals are forwarded upstream.
 
+## Dedicated Workers
+
+To route calls from a dedicated Web Worker, create it with `BrowserAIConnector.createWorker(workerUrl, options)` instead of `new Worker(workerUrl, options)`. The factory installs a worker-local `fetch` relay, so existing GenAI call sites inside the worker stay unchanged. The worker entry URL must use the page's exact origin. Standard worker options, including `{ type: 'module' }`, are passed through.
+
+The worker bootstrap uses a Blob URL, so the page's Content Security Policy must allow `blob:` in `worker-src`. Workers created without this integration, Shared Workers, and Service Workers are not intercepted. Integrated worker requests use the same page-origin/provider assignments and key privacy rules as page requests; unmatched requests use the worker's native fetch. Response streaming and cancellation are forwarded through the extension.
+
 ## Verify
 
 ```sh

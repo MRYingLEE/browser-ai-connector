@@ -17,6 +17,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
   const temporaryDirectory = await mkdtemp(join(tmpdir(), 'browser-ai-connector-'));
   const key = 'sk-test-registered-credential';
   const apiRequests = [];
+  const workerScriptRequests = [];
   const browserConnections = [];
   let chrome;
   let siteServer;
@@ -40,7 +41,40 @@ test('page fetch uses the credential assigned to its page origin without exposin
   ], { stdio: 'ignore' });
   assert.equal(certificateResult.status, 0, 'openssl must create the mock API certificate');
 
-  const serveMockApplication = (_request, response) => {
+  const serveMockApplication = (request, response) => {
+    if (request.url === '/dedicated-worker.js') {
+      workerScriptRequests.push(request.url);
+      response.writeHead(200, { 'content-type': 'text/javascript' });
+      response.end(`self.addEventListener('message', async ({ data }) => {
+        try {
+          const started = performance.now();
+          const response = await fetch(data.url, {
+            method: 'POST',
+            headers: data.headers ?? { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
+            body: JSON.stringify(data.payload),
+          });
+          if (data.terminateAfterResponse) {
+            self.postMessage({ readyToTerminate: true });
+            return;
+          }
+          const reader = response.body.getReader();
+          const first = await reader.read();
+          const firstChunk = new TextDecoder().decode(first.value);
+          const elapsed = performance.now() - started;
+          await reader.cancel();
+          self.postMessage({
+            status: response.status,
+            firstChunk,
+            elapsed,
+            origin: self.location.origin,
+            chrome: typeof chrome,
+          });
+        } catch (error) {
+          self.postMessage({ error: error.message });
+        }
+      });`);
+      return;
+    }
     response.writeHead(200, { 'content-type': 'text/html' });
     response.end('<!doctype html><title>Mock application</title><main>ready</main>');
   };
@@ -502,6 +536,150 @@ test('page fetch uses the credential assigned to its page origin without exposin
     .find((request) => request.host.startsWith('generativelanguage.googleapis.com'));
   assert.equal(unmatchedGoogleRecord.googleApiKey, 'page-placeholder');
   assert.deepEqual(JSON.parse(unmatchedGoogleRecord.body), googlePayload);
+
+  const workerPayload = {
+    model: 'gpt-test-2026-09',
+    messages: [{ role: 'user', content: 'Preserve this worker payload.' }],
+  };
+  let workerResult;
+  try {
+    workerResult = await workerFetch(
+      page,
+      `https://api.openai.com:${apiPort}/v1/stream`,
+      workerPayload,
+      { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
+      true,
+      true,
+    );
+  } catch (error) {
+    throw new Error(`${error.message}; worker scripts fetched: ${workerScriptRequests.length}`);
+  }
+  assert.equal(workerScriptRequests.length, 1);
+  assert.equal(workerResult.status, 200);
+  assert.match(workerResult.firstChunk, /first-stream-chunk/);
+  assert.ok(workerResult.elapsed < 2000, `first worker stream chunk took ${workerResult.elapsed}ms`);
+  assert.equal(workerResult.origin, siteOrigin);
+  assert.equal(workerResult.chrome, 'undefined');
+  assert.equal(JSON.stringify(workerResult).includes(key), false);
+  const workerRecord = [...apiRequests].reverse().find((request) => (
+    request.path === '/v1/stream' && JSON.parse(request.body).messages[0].content === workerPayload.messages[0].content
+  ));
+  assert.equal(workerRecord.authorization, `Bearer ${replacementKey}`);
+  assert.deepEqual(JSON.parse(workerRecord.body), workerPayload);
+  await waitFor(() => workerRecord.cancelled);
+  assert.equal(workerRecord.completed, false);
+
+  const workerAnthropicPayload = {
+    model: 'claude-test-2026-09',
+    max_tokens: 128,
+    messages: [{ role: 'user', content: 'Preserve this Anthropic worker payload.' }],
+  };
+  await saveAssignment(options, siteOrigin, replacementAnthropicKey, 'anthropic');
+  const workerAnthropicResult = await workerFetch(
+    page,
+    `https://api.anthropic.com:${apiPort}/v1/messages`,
+    workerAnthropicPayload,
+    {
+      'x-api-key': 'page-placeholder',
+      'anthropic-version': '2023-06-01',
+      'content-type': 'application/json',
+    },
+  );
+  assert.equal(workerAnthropicResult.status, 200);
+  const workerAnthropicRecord = [...apiRequests].reverse()
+    .find((request) => request.host.startsWith('api.anthropic.com')
+      && JSON.parse(request.body).messages[0].content === workerAnthropicPayload.messages[0].content);
+  assert.equal(workerAnthropicRecord.apiKey, replacementAnthropicKey);
+  assert.equal(workerAnthropicRecord.anthropicVersion, '2023-06-01');
+  assert.deepEqual(JSON.parse(workerAnthropicRecord.body), workerAnthropicPayload);
+
+  await saveAssignment(options, siteOrigin, googleKey, 'google');
+  const workerGooglePayload = {
+    contents: [{ role: 'user', parts: [{ text: 'Preserve this Google AI worker payload.' }] }],
+    generationConfig: { temperature: 0.3 },
+  };
+  const workerGoogleResult = await workerFetch(
+    page,
+    `https://generativelanguage.googleapis.com:${apiPort}/v1beta/models/gemini-test-2026:generateContent?key=page-placeholder`,
+    workerGooglePayload,
+    { 'x-goog-api-key': 'page-placeholder', 'content-type': 'application/json' },
+  );
+  assert.equal(workerGoogleResult.status, 200);
+  const workerGoogleRecord = [...apiRequests].reverse()
+    .find((request) => request.host.startsWith('generativelanguage.googleapis.com')
+      && JSON.parse(request.body).contents?.[0]?.parts?.[0]?.text === workerGooglePayload.contents[0].parts[0].text);
+  assert.equal(workerGoogleRecord.googleApiKey, googleKey);
+  assert.equal(workerGoogleRecord.path, '/v1beta/models/gemini-test-2026:generateContent');
+  assert.deepEqual(JSON.parse(workerGoogleRecord.body), workerGooglePayload);
+
+  const workerCredentials = [key, replacementKey, anthropicKey, replacementAnthropicKey, googleKey];
+  const workerResults = [workerResult, workerAnthropicResult, workerGoogleResult];
+  const observedWorkerMessages = JSON.stringify(await page.evaluate('window.__workerObservedMessages ?? []'));
+  for (const credential of workerCredentials) {
+    assert.equal(JSON.stringify(workerResults).includes(credential), false);
+    assert.equal(observedWorkerMessages.includes(credential), false);
+  }
+
+  const unintegratedPayload = {
+    model: 'gpt-test-2026-09',
+    messages: [{ role: 'user', content: 'Do not integrate this worker.' }],
+  };
+  const unintegratedResult = await workerFetch(
+    page,
+    `https://api.openai.com:${apiPort}/v1/stream`,
+    unintegratedPayload,
+    { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
+    false,
+  );
+  assert.equal(unintegratedResult.status, 200);
+  const unintegratedRecord = [...apiRequests].reverse()
+    .find((request) => request.path === '/v1/stream'
+      && JSON.parse(request.body).messages[0].content === unintegratedPayload.messages[0].content);
+  assert.equal(unintegratedRecord.authorization, 'Bearer page-placeholder');
+
+  const unmatchedWorkerResult = await workerFetch(
+    otherPage,
+    `https://api.openai.com:${apiPort}/v1/stream`,
+    workerPayload,
+    { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
+  );
+  assert.equal(unmatchedWorkerResult.status, 200);
+  const unmatchedWorkerRecord = [...apiRequests].reverse()
+    .find((request) => request.path === '/v1/stream'
+      && JSON.parse(request.body).messages[0].content === workerPayload.messages[0].content);
+  assert.equal(unmatchedWorkerRecord.authorization, 'Bearer page-placeholder');
+  assert.deepEqual(JSON.parse(unmatchedWorkerRecord.body), workerPayload);
+
+  const terminatedPayload = {
+    model: 'gpt-test-2026-09',
+    messages: [{ role: 'user', content: 'Cancel when the worker terminates.' }],
+  };
+  await page.evaluate(`new Promise((resolve, reject) => {
+    const worker = window.BrowserAIConnector.createWorker(new URL('/dedicated-worker.js', location.href));
+    const timeout = setTimeout(() => reject(new Error('termination worker timed out')), 5000);
+    worker.addEventListener('message', (event) => {
+      if (!event.data.readyToTerminate) return;
+      clearTimeout(timeout);
+      worker.terminate();
+      resolve(true);
+    });
+    worker.addEventListener('error', (event) => {
+      clearTimeout(timeout);
+      reject(new Error(event.message));
+    }, { once: true });
+    worker.postMessage({
+      url: 'https://api.openai.com:${apiPort}/v1/stream',
+      payload: ${JSON.stringify(terminatedPayload)},
+      headers: { authorization: 'Bearer page-placeholder', 'content-type': 'application/json' },
+      terminateAfterResponse: true,
+    });
+  })`);
+  const terminatedRecord = [...apiRequests].reverse()
+    .find((request) => request.path === '/v1/stream'
+      && JSON.parse(request.body).messages[0].content === terminatedPayload.messages[0].content);
+  await waitFor(() => terminatedRecord.cancelled);
+  assert.equal(terminatedRecord.authorization, `Bearer ${replacementKey}`);
+  assert.equal(terminatedRecord.completed, false);
 });
 
 async function listen(server) {
@@ -658,6 +836,39 @@ async function pageGoogleFetch(page, apiPort, payload, observeKey = false) {
       };
     } catch (error) {
       return { error: { name: error.name, message: error.message } };
+    }
+  })()`);
+}
+
+async function workerFetch(page, url, payload, headers, integrated = true, observeMessages = false) {
+  const observeWorkerMessages = observeMessages
+    ? "window.__workerObservedMessages = []; addEventListener('message', (event) => window.__workerObservedMessages.push(event.data));"
+    : '';
+  const createWorker = integrated
+    ? "window.BrowserAIConnector.createWorker(new URL('/dedicated-worker.js', location.href))"
+    : "new Worker(new URL('/dedicated-worker.js', location.href))";
+  return page.evaluate(`(async () => {
+    ${observeWorkerMessages}
+    const worker = ${createWorker};
+    try {
+      return await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('worker timed out')), 5000);
+        worker.addEventListener('message', (event) => {
+          clearTimeout(timeout);
+          resolve(event.data);
+        }, { once: true });
+        worker.addEventListener('error', (event) => {
+          clearTimeout(timeout);
+          reject(new Error(event.message));
+        }, { once: true });
+        worker.postMessage({
+          url: ${JSON.stringify(url)},
+          payload: ${JSON.stringify(payload)},
+          headers: ${JSON.stringify(headers)},
+        });
+      });
+    } finally {
+      worker.terminate();
     }
   })()`);
 }
