@@ -8,7 +8,7 @@
     if (!message || message.channel !== channel || message.direction === 'extension') return;
 
     if (message.type === 'request') {
-      const port = chrome.runtime.connect({ name: 'openai-relay' });
+      const port = chrome.runtime.connect({ name: 'provider-relay' });
       calls.set(message.id, port);
       port.onMessage.addListener((reply) => {
         window.postMessage({ channel, direction: 'extension', ...reply }, window.location.origin);

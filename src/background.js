@@ -1,4 +1,7 @@
-const storageKey = 'openaiAssignments';
+const assignmentStorageKeys = {
+  openai: 'openaiAssignments',
+  anthropic: 'anthropicAssignments',
+};
 const maximumRequestBytes = 8 * 1024 * 1024;
 
 chrome.action.onClicked.addListener(() => chrome.runtime.openOptionsPage());
@@ -9,7 +12,7 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 });
 
 chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== 'openai-relay') return;
+  if (port.name !== 'provider-relay') return;
   const calls = new Map();
 
   port.onMessage.addListener((message) => {
@@ -39,14 +42,19 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 async function manageAssignments(message) {
-  const stored = await chrome.storage.local.get(storageKey);
-  const assignments = stored[storageKey] ?? {};
+  const stored = await chrome.storage.local.get(Object.values(assignmentStorageKeys));
 
   if (message?.type === 'list-assignments') {
-    return Object.entries(assignments)
-      .map(([origin, assignment]) => ({ origin, hasKey: usableKey(assignment?.apiKey) }))
-      .sort((left, right) => left.origin.localeCompare(right.origin));
+    return Object.entries(assignmentStorageKeys)
+      .flatMap(([provider, storageKey]) => Object.entries(stored[storageKey] ?? {})
+        .map(([origin, assignment]) => ({ provider, origin, hasKey: usableKey(assignment?.apiKey) })))
+      .sort((left, right) => left.origin.localeCompare(right.origin) || left.provider.localeCompare(right.provider));
   }
+
+  const provider = validateProvider(message?.provider ?? 'openai');
+  if (!provider) throw new Error('Choose a supported provider.');
+  const storageKey = assignmentStorageKeys[provider];
+  const assignments = stored[storageKey] ?? {};
 
   if (message?.type === 'save-assignment') {
     const origin = validateOrigin(message.origin);
@@ -77,15 +85,21 @@ async function manageAssignments(message) {
   throw new Error('Unsupported management operation.');
 }
 
+function validateProvider(value) {
+  return Object.hasOwn(assignmentStorageKeys, value) ? value : null;
+}
+
 async function relayRequest(port, message, call, calls) {
   const senderOrigin = new URL(port.sender.url).origin;
   const requestUrl = new URL(message.url);
-  if (requestUrl.protocol !== 'https:' || requestUrl.hostname !== 'api.openai.com' || !requestUrl.pathname.startsWith('/v1/')) {
+  const provider = providerForRequest(requestUrl);
+  if (!provider) {
     port.postMessage({ type: 'route', id: message.id, route: 'native' });
     calls.delete(message.id);
     return;
   }
 
+  const storageKey = assignmentStorageKeys[provider];
   const stored = await chrome.storage.local.get(storageKey);
   const assignment = stored[storageKey]?.[senderOrigin];
   if (!assignment) {
@@ -107,7 +121,8 @@ async function relayRequest(port, message, call, calls) {
   try {
     const headers = new Headers(message.headers);
     for (const name of ['authorization', 'cookie', 'proxy-authorization', 'x-api-key']) headers.delete(name);
-    headers.set('authorization', `Bearer ${assignment.apiKey}`);
+    if (provider === 'openai') headers.set('authorization', `Bearer ${assignment.apiKey}`);
+    else headers.set('x-api-key', assignment.apiKey);
     const method = String(message.method).toUpperCase();
     const hasBody = !['GET', 'HEAD'].includes(method);
     const response = await fetch(requestUrl, {
@@ -145,6 +160,13 @@ async function relayRequest(port, message, call, calls) {
   } finally {
     calls.delete(message.id);
   }
+}
+
+function providerForRequest(url) {
+  if (url.protocol !== 'https:') return null;
+  if (url.hostname === 'api.openai.com' && url.pathname.startsWith('/v1/')) return 'openai';
+  if (url.hostname === 'api.anthropic.com' && url.pathname === '/v1/messages') return 'anthropic';
+  return null;
 }
 
 function validateOrigin(value) {

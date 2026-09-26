@@ -20,7 +20,7 @@
       if (message.route === 'native') {
         request.resolve(nativeFetch(request.nativeRequest));
       } else {
-        request.reject(new TypeError('The configured OpenAI credential is unavailable.'));
+        request.reject(new TypeError('The configured provider credential is unavailable.'));
       }
       return;
     }
@@ -59,8 +59,8 @@
     }
 
     if (message.type === 'error') {
-      request.controller?.error(new TypeError('The OpenAI request could not be completed.'));
-      request.reject(new TypeError('The OpenAI request could not be completed.'));
+      request.controller?.error(new TypeError('The provider request could not be completed.'));
+      request.reject(new TypeError('The provider request could not be completed.'));
       finish(message.id);
     }
   }
@@ -83,7 +83,13 @@
     }
 
     const requestUrl = new URL(request.url);
-    if (requestUrl.protocol !== 'https:' || requestUrl.hostname !== 'api.openai.com' || !requestUrl.pathname.startsWith('/v1/')) {
+    const isOpenAiRequest = requestUrl.protocol === 'https:'
+      && requestUrl.hostname === 'api.openai.com'
+      && requestUrl.pathname.startsWith('/v1/');
+    const isAnthropicRequest = requestUrl.protocol === 'https:'
+      && requestUrl.hostname === 'api.anthropic.com'
+      && requestUrl.pathname === '/v1/messages';
+    if (!isOpenAiRequest && !isAnthropicRequest) {
       return nativeFetch(request);
     }
 
@@ -131,7 +137,7 @@
           body,
         });
       } catch {
-        rejectRequest(new TypeError('The OpenAI request could not be prepared.'));
+        rejectRequest(new TypeError('The provider request could not be prepared.'));
         finish(id);
       }
     })();

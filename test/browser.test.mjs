@@ -20,13 +20,14 @@ test('page fetch uses the credential assigned to its page origin without exposin
   const browserConnections = [];
   let chrome;
   let siteServer;
+  let otherSiteServer;
   let apiServer;
 
   t.after(async () => {
     for (const connection of browserConnections) connection.close();
     await stopBrowser(chrome);
-    await Promise.all([closeServer(siteServer), closeServer(apiServer)]);
-    await rm(temporaryDirectory, { recursive: true, force: true });
+    await Promise.all([closeServer(siteServer), closeServer(otherSiteServer), closeServer(apiServer)]);
+    await rm(temporaryDirectory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   });
 
   const keyPath = join(temporaryDirectory, 'localhost-key.pem');
@@ -34,15 +35,19 @@ test('page fetch uses the credential assigned to its page origin without exposin
   const certificateResult = spawnSync('openssl', [
     'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
     '-keyout', keyPath, '-out', certificatePath,
-    '-subj', '/CN=api.openai.com', '-addext', 'subjectAltName=DNS:api.openai.com',
+    '-subj', '/CN=api.openai.com',
+    '-addext', 'subjectAltName=DNS:api.openai.com,DNS:api.anthropic.com',
   ], { stdio: 'ignore' });
   assert.equal(certificateResult.status, 0, 'openssl must create the mock API certificate');
 
-  siteServer = createHttpServer((_request, response) => {
+  const serveMockApplication = (_request, response) => {
     response.writeHead(200, { 'content-type': 'text/html' });
     response.end('<!doctype html><title>Mock application</title><main>ready</main>');
-  });
+  };
+  siteServer = createHttpServer(serveMockApplication);
+  otherSiteServer = createHttpServer(serveMockApplication);
   await listen(siteServer);
+  if (!process.env.JUPYTERLITE_URL) await listen(otherSiteServer);
 
   apiServer = createHttpsServer({
     key: await readFile(keyPath),
@@ -50,7 +55,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
   }, async (request, response) => {
     response.setHeader('access-control-allow-origin', request.headers.origin ?? '*');
     response.setHeader('access-control-allow-methods', 'POST, GET, OPTIONS');
-    response.setHeader('access-control-allow-headers', 'authorization, content-type');
+    response.setHeader('access-control-allow-headers', 'authorization, content-type, x-api-key, anthropic-version, anthropic-dangerous-direct-browser-access');
     if (request.method === 'OPTIONS') {
       response.writeHead(204);
       response.end();
@@ -60,7 +65,10 @@ test('page fetch uses the credential assigned to its page origin without exposin
     for await (const chunk of request) chunks.push(chunk);
     let markClosed;
     const record = {
+      host: request.headers.host,
       authorization: request.headers.authorization,
+      apiKey: request.headers['x-api-key'],
+      anthropicVersion: request.headers['anthropic-version'],
       method: request.method,
       path: request.url,
       body: Buffer.concat(chunks).toString('utf8'),
@@ -69,14 +77,21 @@ test('page fetch uses the credential assigned to its page origin without exposin
       closed: new Promise((resolveClosed) => { markClosed = resolveClosed; }),
     };
     apiRequests.push(record);
-    if (request.url === '/v1/stream') {
+    const isAnthropicStream = request.headers.host.startsWith('api.anthropic.com')
+      && request.url === '/v1/messages'
+      && JSON.parse(record.body).stream === true;
+    if (request.url === '/v1/stream' || isAnthropicStream) {
       response.writeHead(200, { 'content-type': 'text/event-stream' });
       response.flushHeaders();
-      response.write('data: first-stream-chunk\n\n');
+      response.write(isAnthropicStream
+        ? 'event: message_start\ndata: {"type":"message_start"}\n\n'
+        : 'data: first-stream-chunk\n\n');
       const timer = setTimeout(() => {
         if (response.destroyed) return;
         record.completed = true;
-        response.end('data: final-stream-chunk\n\n');
+        response.end(isAnthropicStream
+          ? 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+          : 'data: final-stream-chunk\n\n');
       }, 4000);
       response.on('finish', () => {
         record.completed = true;
@@ -90,7 +105,9 @@ test('page fetch uses the credential assigned to its page origin without exposin
       return;
     }
     response.writeHead(200, { 'content-type': 'application/json' });
-    response.end(JSON.stringify({ id: 'chatcmpl-mock', model: 'gpt-test-2026-09', choices: [] }));
+    response.end(JSON.stringify(request.headers.host.startsWith('api.anthropic.com')
+      ? { id: 'msg_mock', type: 'message', model: 'claude-test-2026-09', content: [{ type: 'text', text: 'mock response' }] }
+      : { id: 'chatcmpl-mock', model: 'gpt-test-2026-09', choices: [] }));
   });
   await listen(apiServer);
 
@@ -102,7 +119,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
   chrome = spawn(chromeExecutable, [
     '--headless=new', '--no-sandbox', '--disable-gpu', '--no-first-run',
     '--no-default-browser-check', '--ignore-certificate-errors',
-    '--host-resolver-rules=MAP api.openai.com 127.0.0.1',
+    '--host-resolver-rules=MAP api.openai.com 127.0.0.1, MAP api.anthropic.com 127.0.0.1',
     '--remote-debugging-port=0', `--user-data-dir=${profileDirectory}`,
     `--disable-extensions-except=${root}`, `--load-extension=${root}`,
     'about:blank',
@@ -220,7 +237,9 @@ test('page fetch uses the credential assigned to its page origin without exposin
   await delay(300);
   assert.equal(apiRequests.some((request) => request.path === '/v1/abort-during-body'), false);
 
-  const otherOrigin = `http://localhost:${siteServer.address().port}`;
+  const otherOrigin = process.env.JUPYTERLITE_URL
+    ? `http://localhost:${siteServer.address().port}`
+    : `http://127.0.0.1:${otherSiteServer.address().port}`;
   const otherPage = await openPage(browserConnection, otherOrigin);
   await otherPage.waitUntil('document.querySelector("main")?.textContent === "ready"');
   const unmatchedResult = await pageOpenAiFetch(otherPage, apiPort, payload);
@@ -257,6 +276,124 @@ test('page fetch uses the credential assigned to its page origin without exposin
     assert.equal(apiRequests[4].authorization, 'Bearer page-placeholder');
     assert.equal(apiRequests.length, 5);
   }
+
+  assert.equal(await options.evaluate('document.querySelector("#provider")?.tagName'), 'SELECT');
+  await saveAssignment(options, siteOrigin, replacementKey, 'openai');
+  const openAiAfterProviderAddition = await pageOpenAiFetch(page, apiPort, payload);
+  assert.equal(openAiAfterProviderAddition.status, 200);
+  assert.equal(apiRequests.at(-1).authorization, `Bearer ${replacementKey}`);
+
+  const anthropicKey = 'sk-ant-test-registered-credential';
+  const anthropicPayload = {
+    model: 'claude-test-2026-09',
+    max_tokens: 128,
+    messages: [{ role: 'user', content: 'Keep this Anthropic payload unchanged.' }],
+  };
+  await saveAssignment(options, siteOrigin, anthropicKey, 'anthropic');
+  const anthropicResult = await pageAnthropicFetch(page, apiPort, anthropicPayload, true);
+  assert.equal(anthropicResult.status, 200, JSON.stringify({ anthropicResult, apiRequests }));
+  assert.equal(anthropicResult.body.id, 'msg_mock');
+  assert.equal(anthropicResult.observed.includes(anthropicKey), false);
+  assert.equal(anthropicResult.storage.includes(anthropicKey), false);
+  const anthropicRecord = apiRequests.find((request) => request.host.startsWith('api.anthropic.com'));
+  assert.equal(anthropicRecord.apiKey, anthropicKey);
+  assert.equal(anthropicRecord.authorization, undefined);
+  assert.equal(anthropicRecord.anthropicVersion, '2023-06-01');
+  assert.equal(anthropicRecord.path, '/v1/messages');
+  assert.deepEqual(JSON.parse(anthropicRecord.body), anthropicPayload);
+
+  const unmatchedAnthropicResult = await pageAnthropicFetch(otherPage, apiPort, anthropicPayload);
+  assert.equal(unmatchedAnthropicResult.status, 200);
+  const unmatchedAnthropicRecord = [...apiRequests].reverse()
+    .find((request) => request.host.startsWith('api.anthropic.com'));
+  assert.equal(unmatchedAnthropicRecord.apiKey, 'page-placeholder');
+  assert.deepEqual(JSON.parse(unmatchedAnthropicRecord.body), anthropicPayload);
+
+  const replacementAnthropicKey = 'sk-ant-test-replacement-credential';
+  await saveAssignment(options, siteOrigin, replacementAnthropicKey, 'anthropic');
+  const replacedAnthropicResult = await pageAnthropicFetch(page, apiPort, anthropicPayload);
+  assert.equal(replacedAnthropicResult.status, 200);
+  const replacedAnthropicRecord = [...apiRequests].reverse()
+    .find((request) => request.host.startsWith('api.anthropic.com'));
+  assert.equal(replacedAnthropicRecord.apiKey, replacementAnthropicKey);
+  assert.deepEqual(JSON.parse(replacedAnthropicRecord.body), anthropicPayload);
+
+  const anthropicStreamPayload = { ...anthropicPayload, stream: true };
+  const anthropicStreamResult = await page.evaluate(`(async () => {
+    const started = performance.now();
+    const response = await fetch('https://api.anthropic.com:${apiPort}/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': 'page-placeholder',
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: ${JSON.stringify(JSON.stringify(anthropicStreamPayload))},
+    });
+    const reader = response.body.getReader();
+    const first = await reader.read();
+    const firstChunk = new TextDecoder().decode(first.value);
+    const elapsed = performance.now() - started;
+    await reader.cancel();
+    return { status: response.status, firstChunk, elapsed };
+  })()`);
+  assert.equal(anthropicStreamResult.status, 200);
+  assert.match(anthropicStreamResult.firstChunk, /message_start/);
+  assert.ok(anthropicStreamResult.elapsed < 2000);
+  const anthropicStreamRecord = [...apiRequests].reverse()
+    .find((request) => request.host.startsWith('api.anthropic.com') && JSON.parse(request.body).stream);
+  assert.equal(anthropicStreamRecord.apiKey, replacementAnthropicKey);
+  assert.deepEqual(JSON.parse(anthropicStreamRecord.body), anthropicStreamPayload);
+  await waitFor(() => anthropicStreamRecord.cancelled);
+  assert.equal(anthropicStreamRecord.completed, false);
+
+  const abortedAnthropicStreamResult = await page.evaluate(`(async () => {
+    const abortController = new AbortController();
+    const response = await fetch('https://api.anthropic.com:${apiPort}/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': 'page-placeholder',
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json',
+      },
+      body: ${JSON.stringify(JSON.stringify(anthropicStreamPayload))},
+      signal: abortController.signal,
+    });
+    const reader = response.body.getReader();
+    await reader.read();
+    abortController.abort();
+    try {
+      await reader.read();
+      return 'resolved';
+    } catch (error) {
+      return error.name;
+    }
+  })()`);
+  assert.equal(abortedAnthropicStreamResult, 'AbortError');
+  const abortedAnthropicRecord = [...apiRequests].reverse()
+    .find((request) => request.host.startsWith('api.anthropic.com') && JSON.parse(request.body).stream);
+  await waitFor(() => abortedAnthropicRecord.cancelled);
+  assert.equal(abortedAnthropicRecord.completed, false);
+
+  const anthropicRecordCount = apiRequests.filter((request) => request.host.startsWith('api.anthropic.com')).length;
+  await clickAssignmentAction(options, siteOrigin, 'anthropic', 'remove-key');
+  await options.waitUntil(`[...document.querySelectorAll('[data-provider]')]
+    .find((entry) => entry.dataset.origin === ${JSON.stringify(siteOrigin)}
+      && entry.dataset.provider === 'anthropic')?.textContent.includes('No key stored')`);
+  const blockedAnthropicResult = await pageAnthropicFetch(page, apiPort, anthropicPayload);
+  assert.equal(blockedAnthropicResult.error?.name, 'TypeError');
+  assert.equal(apiRequests.filter((request) => request.host.startsWith('api.anthropic.com')).length, anthropicRecordCount);
+
+  await clickAssignmentAction(options, siteOrigin, 'anthropic', 'remove-assignment');
+  await options.waitUntil(`![...document.querySelectorAll('[data-provider]')]
+    .some((entry) => entry.dataset.origin === ${JSON.stringify(siteOrigin)}
+      && entry.dataset.provider === 'anthropic')`);
+  const unassignedAnthropicResult = await pageAnthropicFetch(page, apiPort, anthropicPayload);
+  assert.equal(unassignedAnthropicResult.status, 200);
+  const unassignedAnthropicRecord = [...apiRequests].reverse()
+    .find((request) => request.host.startsWith('api.anthropic.com'));
+  assert.equal(unassignedAnthropicRecord.apiKey, 'page-placeholder');
+  assert.deepEqual(JSON.parse(unassignedAnthropicRecord.body), anthropicPayload);
 });
 
 async function listen(server) {
@@ -339,13 +476,55 @@ async function openPage(browser, url) {
   };
 }
 
-async function saveAssignment(options, origin, key) {
+async function saveAssignment(options, origin, key, provider = 'openai') {
   await options.evaluate(`(() => {
+    const providerSelect = document.querySelector('#provider');
+    if (providerSelect) providerSelect.value = ${JSON.stringify(provider)};
     document.querySelector('#origin').value = ${JSON.stringify(origin)};
     document.querySelector('#api-key').value = ${JSON.stringify(key)};
     document.querySelector('#save-assignment').click();
   })()`);
   await options.waitUntil('document.querySelector("#status").textContent === "Assignment saved."');
+}
+
+async function clickAssignmentAction(options, origin, provider, action) {
+  await options.evaluate(`(() => {
+    const row = [...document.querySelectorAll('[data-provider]')]
+      .find((entry) => entry.dataset.origin === ${JSON.stringify(origin)}
+        && entry.dataset.provider === ${JSON.stringify(provider)});
+    row.querySelector('[data-action="${action}"]').click();
+  })()`);
+}
+
+async function pageAnthropicFetch(page, apiPort, payload, observeKey = false) {
+  return page.evaluate(`(async () => {
+    ${observeKey ? "window.__observedMessages = []; addEventListener('message', (event) => window.__observedMessages.push(event.data));" : ''}
+    try {
+      const response = await fetch('https://api.anthropic.com:${apiPort}/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': 'page-placeholder',
+          'anthropic-version': '2023-06-01',
+          'content-type': 'application/json',
+        },
+        body: ${JSON.stringify(JSON.stringify(payload))},
+      });
+      return {
+        status: response.status,
+        body: await response.json(),
+        observed: JSON.stringify(window.__observedMessages ?? []),
+        storage: (() => {
+          try {
+            return JSON.stringify([localStorage, sessionStorage]);
+          } catch {
+            return 'inaccessible';
+          }
+        })(),
+      };
+    } catch (error) {
+      return { error: { name: error.name, message: error.message } };
+    }
+  })()`);
 }
 
 async function pageOpenAiFetch(page, apiPort, payload, observeKey = false) {
