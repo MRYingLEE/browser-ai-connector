@@ -1,6 +1,6 @@
 # Browser AI Connector
 
-Browser AI Connector is a Manifest V3 Chrome extension for using OpenAI and Anthropic credentials from page `fetch` calls without placing the registered key in page JavaScript. It supports `https://api.openai.com/v1/*` and Anthropic `POST https://api.anthropic.com/v1/messages` requests from exact page origins.
+Browser AI Connector is a Manifest V3 Chrome extension for using OpenAI, Anthropic, and Google AI credentials from page `fetch` calls without placing the registered key in page JavaScript. It supports `https://api.openai.com/v1/*`, Anthropic `POST https://api.anthropic.com/v1/messages`, and Google AI `POST` requests to the `v1` and `v1beta` `models/{model}:generateContent` and `:streamGenerateContent` endpoints on `generativelanguage.googleapis.com`. Google AI credentials are sent in the `x-goog-api-key` header, not the request URL.
 
 ## Install
 
@@ -19,6 +19,6 @@ Unmatched requests keep the page's native network path. A matching request repla
 npm test
 ```
 
-The browser test uses local mock OpenAI and Anthropic endpoints and a disposable browser profile. It needs Node.js 20+, Chrome or Chromium, and OpenSSL. The runner prefers an installed Chromium or cached Playwright Chromium; set `CHROME_EXECUTABLE_PATH` to select another browser executable. Some branded Chrome builds restrict loading unpacked extensions from command-line automation, so use an unbranded Chromium for the automated test when needed.
+The browser test uses local mock OpenAI, Anthropic, and Google AI endpoints and a disposable browser profile. It needs Node.js 20+, Chrome or Chromium, and OpenSSL. The runner prefers an installed Chromium or cached Playwright Chromium; set `CHROME_EXECUTABLE_PATH` to select another browser executable. Some branded Chrome builds restrict loading unpacked extensions from command-line automation, so use an unbranded Chromium for the automated test when needed.
 
-To exercise the same relay from a reachable JupyterLite deployment, set `JUPYTERLITE_URL` to its page URL. The test still sends OpenAI and Anthropic traffic only to local mocks; loading the application page itself requires network access.
+To exercise the same relay from a reachable JupyterLite deployment, set `JUPYTERLITE_URL` to its page URL. The test still sends OpenAI, Anthropic, and Google AI traffic only to local mocks; loading the application page itself requires network access.

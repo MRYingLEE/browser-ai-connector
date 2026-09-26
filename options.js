@@ -56,7 +56,8 @@ function createAssignmentRow(entry) {
 
   const details = document.createElement('div');
   const origin = document.createElement('strong');
-  origin.textContent = `${entry.provider === 'openai' ? 'OpenAI' : 'Anthropic'} · ${entry.origin}`;
+  const providerName = { openai: 'OpenAI', anthropic: 'Anthropic', google: 'Google AI' }[entry.provider];
+  origin.textContent = `${providerName} · ${entry.origin}`;
   const keyStatus = document.createElement('span');
   keyStatus.textContent = entry.hasKey ? 'Key stored locally' : 'No key stored';
   details.append(origin, keyStatus);

@@ -1,6 +1,7 @@
 const assignmentStorageKeys = {
   openai: 'openaiAssignments',
   anthropic: 'anthropicAssignments',
+  google: 'googleAssignments',
 };
 const maximumRequestBytes = 8 * 1024 * 1024;
 
@@ -98,6 +99,7 @@ async function relayRequest(port, message, call, calls) {
     calls.delete(message.id);
     return;
   }
+  if (provider === 'google') requestUrl.searchParams.delete('key');
 
   const storageKey = assignmentStorageKeys[provider];
   const stored = await chrome.storage.local.get(storageKey);
@@ -120,9 +122,10 @@ async function relayRequest(port, message, call, calls) {
 
   try {
     const headers = new Headers(message.headers);
-    for (const name of ['authorization', 'cookie', 'proxy-authorization', 'x-api-key']) headers.delete(name);
+    for (const name of ['authorization', 'cookie', 'proxy-authorization', 'x-api-key', 'x-goog-api-key']) headers.delete(name);
     if (provider === 'openai') headers.set('authorization', `Bearer ${assignment.apiKey}`);
-    else headers.set('x-api-key', assignment.apiKey);
+    else if (provider === 'anthropic') headers.set('x-api-key', assignment.apiKey);
+    else headers.set('x-goog-api-key', assignment.apiKey);
     const method = String(message.method).toUpperCase();
     const hasBody = !['GET', 'HEAD'].includes(method);
     const response = await fetch(requestUrl, {
@@ -166,6 +169,8 @@ function providerForRequest(url) {
   if (url.protocol !== 'https:') return null;
   if (url.hostname === 'api.openai.com' && url.pathname.startsWith('/v1/')) return 'openai';
   if (url.hostname === 'api.anthropic.com' && url.pathname === '/v1/messages') return 'anthropic';
+  if (url.hostname === 'generativelanguage.googleapis.com'
+    && /^\/v1(?:beta)?\/models\/[^/]+:(?:generateContent|streamGenerateContent)$/.test(url.pathname)) return 'google';
   return null;
 }
 

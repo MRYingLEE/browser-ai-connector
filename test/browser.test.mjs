@@ -36,7 +36,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
     'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
     '-keyout', keyPath, '-out', certificatePath,
     '-subj', '/CN=api.openai.com',
-    '-addext', 'subjectAltName=DNS:api.openai.com,DNS:api.anthropic.com',
+    '-addext', 'subjectAltName=DNS:api.openai.com,DNS:api.anthropic.com,DNS:generativelanguage.googleapis.com',
   ], { stdio: 'ignore' });
   assert.equal(certificateResult.status, 0, 'openssl must create the mock API certificate');
 
@@ -55,7 +55,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
   }, async (request, response) => {
     response.setHeader('access-control-allow-origin', request.headers.origin ?? '*');
     response.setHeader('access-control-allow-methods', 'POST, GET, OPTIONS');
-    response.setHeader('access-control-allow-headers', 'authorization, content-type, x-api-key, anthropic-version, anthropic-dangerous-direct-browser-access');
+    response.setHeader('access-control-allow-headers', 'authorization, content-type, x-api-key, x-goog-api-key, anthropic-version, anthropic-dangerous-direct-browser-access');
     if (request.method === 'OPTIONS') {
       response.writeHead(204);
       response.end();
@@ -68,6 +68,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
       host: request.headers.host,
       authorization: request.headers.authorization,
       apiKey: request.headers['x-api-key'],
+      googleApiKey: request.headers['x-goog-api-key'],
       anthropicVersion: request.headers['anthropic-version'],
       method: request.method,
       path: request.url,
@@ -80,12 +81,16 @@ test('page fetch uses the credential assigned to its page origin without exposin
     const isAnthropicStream = request.headers.host.startsWith('api.anthropic.com')
       && request.url === '/v1/messages'
       && JSON.parse(record.body).stream === true;
-    if (request.url === '/v1/stream' || isAnthropicStream) {
+    const isGoogleStream = request.headers.host.startsWith('generativelanguage.googleapis.com')
+      && request.url.startsWith('/v1beta/models/gemini-test-2026:streamGenerateContent');
+    if (request.url === '/v1/stream' || isAnthropicStream || isGoogleStream) {
       response.writeHead(200, { 'content-type': 'text/event-stream' });
       response.flushHeaders();
       response.write(isAnthropicStream
         ? 'event: message_start\ndata: {"type":"message_start"}\n\n'
-        : 'data: first-stream-chunk\n\n');
+        : isGoogleStream
+          ? 'data: {"candidates":[{"content":{"parts":[{"text":"first Google chunk"}]}}]}\n\n'
+          : 'data: first-stream-chunk\n\n');
       const timer = setTimeout(() => {
         if (response.destroyed) return;
         record.completed = true;
@@ -107,7 +112,9 @@ test('page fetch uses the credential assigned to its page origin without exposin
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify(request.headers.host.startsWith('api.anthropic.com')
       ? { id: 'msg_mock', type: 'message', model: 'claude-test-2026-09', content: [{ type: 'text', text: 'mock response' }] }
-      : { id: 'chatcmpl-mock', model: 'gpt-test-2026-09', choices: [] }));
+      : request.headers.host.startsWith('generativelanguage.googleapis.com')
+        ? { candidates: [{ content: { role: 'model', parts: [{ text: 'mock response' }] } }] }
+        : { id: 'chatcmpl-mock', model: 'gpt-test-2026-09', choices: [] }));
   });
   await listen(apiServer);
 
@@ -119,7 +126,7 @@ test('page fetch uses the credential assigned to its page origin without exposin
   chrome = spawn(chromeExecutable, [
     '--headless=new', '--no-sandbox', '--disable-gpu', '--no-first-run',
     '--no-default-browser-check', '--ignore-certificate-errors',
-    '--host-resolver-rules=MAP api.openai.com 127.0.0.1, MAP api.anthropic.com 127.0.0.1',
+    '--host-resolver-rules=MAP api.openai.com 127.0.0.1, MAP api.anthropic.com 127.0.0.1, MAP generativelanguage.googleapis.com 127.0.0.1',
     '--remote-debugging-port=0', `--user-data-dir=${profileDirectory}`,
     `--disable-extensions-except=${root}`, `--load-extension=${root}`,
     'about:blank',
@@ -394,6 +401,107 @@ test('page fetch uses the credential assigned to its page origin without exposin
     .find((request) => request.host.startsWith('api.anthropic.com'));
   assert.equal(unassignedAnthropicRecord.apiKey, 'page-placeholder');
   assert.deepEqual(JSON.parse(unassignedAnthropicRecord.body), anthropicPayload);
+
+  const googleKey = 'test-google-registered-credential';
+  const googlePayload = {
+    contents: [{ role: 'user', parts: [{ text: 'Keep this Google AI payload unchanged.' }] }],
+    generationConfig: { temperature: 0.2 },
+  };
+  await saveAssignment(options, siteOrigin, googleKey, 'google');
+  const wrongOriginGoogleResult = await pageGoogleFetch(otherPage, apiPort, googlePayload);
+  assert.equal(wrongOriginGoogleResult.status, 200);
+  const wrongOriginGoogleRecord = [...apiRequests].reverse()
+    .find((request) => request.host.startsWith('generativelanguage.googleapis.com'));
+  assert.equal(wrongOriginGoogleRecord.googleApiKey, 'page-placeholder');
+  const googleResult = await pageGoogleFetch(page, apiPort, googlePayload, true);
+  assert.equal(googleResult.status, 200, JSON.stringify({ googleResult, apiRequests }));
+  assert.equal(googleResult.body.candidates[0].content.parts[0].text, 'mock response');
+  assert.equal(googleResult.observed.includes(googleKey), false);
+  assert.equal(googleResult.storage.includes(googleKey), false);
+  const googleRecord = [...apiRequests].reverse()
+    .find((request) => request.host.startsWith('generativelanguage.googleapis.com'));
+  assert.equal(googleRecord.googleApiKey, googleKey);
+  assert.equal(googleRecord.apiKey, undefined);
+  assert.equal(googleRecord.authorization, undefined);
+  assert.equal(googleRecord.path, '/v1beta/models/gemini-test-2026:generateContent');
+  assert.deepEqual(JSON.parse(googleRecord.body), googlePayload);
+
+  const replacementGoogleKey = 'test-google-replacement-credential';
+  await saveAssignment(options, siteOrigin, replacementGoogleKey, 'google');
+  const replacedGoogleResult = await pageGoogleFetch(page, apiPort, googlePayload);
+  assert.equal(replacedGoogleResult.status, 200);
+  const replacedGoogleRecord = [...apiRequests].reverse()
+    .find((request) => request.host.startsWith('generativelanguage.googleapis.com'));
+  assert.equal(replacedGoogleRecord.googleApiKey, replacementGoogleKey);
+  assert.deepEqual(JSON.parse(replacedGoogleRecord.body), googlePayload);
+
+  const googleStreamResult = await page.evaluate(`(async () => {
+    const response = await fetch('https://generativelanguage.googleapis.com:${apiPort}/v1beta/models/gemini-test-2026:streamGenerateContent?alt=sse', {
+      method: 'POST',
+      headers: { 'x-goog-api-key': 'page-placeholder', 'content-type': 'application/json' },
+      body: ${JSON.stringify(JSON.stringify(googlePayload))},
+    });
+    const reader = response.body.getReader();
+    const first = await reader.read();
+    const firstChunk = new TextDecoder().decode(first.value);
+    await reader.cancel();
+    return { status: response.status, firstChunk };
+  })()`);
+  assert.equal(googleStreamResult.status, 200);
+  assert.match(googleStreamResult.firstChunk, /first Google chunk/);
+  const googleStreamRecord = [...apiRequests].reverse()
+    .find((request) => request.host.startsWith('generativelanguage.googleapis.com')
+      && request.path.includes(':streamGenerateContent'));
+  assert.equal(googleStreamRecord.googleApiKey, replacementGoogleKey);
+  assert.equal(googleStreamRecord.path, '/v1beta/models/gemini-test-2026:streamGenerateContent?alt=sse');
+  assert.deepEqual(JSON.parse(googleStreamRecord.body), googlePayload);
+  await waitFor(() => googleStreamRecord.cancelled);
+  assert.equal(googleStreamRecord.completed, false);
+
+  const abortedGoogleStream = await page.evaluate(`(async () => {
+    const abortController = new AbortController();
+    const response = await fetch('https://generativelanguage.googleapis.com:${apiPort}/v1beta/models/gemini-test-2026:streamGenerateContent?alt=sse', {
+      method: 'POST',
+      headers: { 'x-goog-api-key': 'page-placeholder', 'content-type': 'application/json' },
+      body: ${JSON.stringify(JSON.stringify(googlePayload))},
+      signal: abortController.signal,
+    });
+    const reader = response.body.getReader();
+    await reader.read();
+    abortController.abort();
+    try {
+      await reader.read();
+      return 'resolved';
+    } catch (error) {
+      return error.name;
+    }
+  })()`);
+  assert.equal(abortedGoogleStream, 'AbortError');
+  const abortedGoogleRecord = [...apiRequests].reverse()
+    .find((request) => request.host.startsWith('generativelanguage.googleapis.com')
+      && request.path.includes(':streamGenerateContent'));
+  await waitFor(() => abortedGoogleRecord.cancelled);
+  assert.equal(abortedGoogleRecord.completed, false);
+
+  const googleRecordCount = apiRequests.filter((request) => request.host.startsWith('generativelanguage.googleapis.com')).length;
+  await clickAssignmentAction(options, siteOrigin, 'google', 'remove-key');
+  await options.waitUntil(`[...document.querySelectorAll('[data-provider]')]
+    .find((entry) => entry.dataset.origin === ${JSON.stringify(siteOrigin)}
+      && entry.dataset.provider === 'google')?.textContent.includes('No key stored')`);
+  const blockedGoogleResult = await pageGoogleFetch(page, apiPort, googlePayload);
+  assert.equal(blockedGoogleResult.error?.name, 'TypeError');
+  assert.equal(apiRequests.filter((request) => request.host.startsWith('generativelanguage.googleapis.com')).length, googleRecordCount);
+
+  await clickAssignmentAction(options, siteOrigin, 'google', 'remove-assignment');
+  await options.waitUntil(`![...document.querySelectorAll('[data-provider]')]
+    .some((entry) => entry.dataset.origin === ${JSON.stringify(siteOrigin)}
+      && entry.dataset.provider === 'google')`);
+  const unmatchedGoogleResult = await pageGoogleFetch(otherPage, apiPort, googlePayload);
+  assert.equal(unmatchedGoogleResult.status, 200);
+  const unmatchedGoogleRecord = [...apiRequests].reverse()
+    .find((request) => request.host.startsWith('generativelanguage.googleapis.com'));
+  assert.equal(unmatchedGoogleRecord.googleApiKey, 'page-placeholder');
+  assert.deepEqual(JSON.parse(unmatchedGoogleRecord.body), googlePayload);
 });
 
 async function listen(server) {
@@ -507,6 +615,33 @@ async function pageAnthropicFetch(page, apiPort, payload, observeKey = false) {
           'anthropic-version': '2023-06-01',
           'content-type': 'application/json',
         },
+        body: ${JSON.stringify(JSON.stringify(payload))},
+      });
+      return {
+        status: response.status,
+        body: await response.json(),
+        observed: JSON.stringify(window.__observedMessages ?? []),
+        storage: (() => {
+          try {
+            return JSON.stringify([localStorage, sessionStorage]);
+          } catch {
+            return 'inaccessible';
+          }
+        })(),
+      };
+    } catch (error) {
+      return { error: { name: error.name, message: error.message } };
+    }
+  })()`);
+}
+
+async function pageGoogleFetch(page, apiPort, payload, observeKey = false) {
+  return page.evaluate(`(async () => {
+    ${observeKey ? "window.__observedMessages = []; addEventListener('message', (event) => window.__observedMessages.push(event.data));" : ''}
+    try {
+      const response = await fetch('https://generativelanguage.googleapis.com:${apiPort}/v1beta/models/gemini-test-2026:generateContent?key=page-placeholder', {
+        method: 'POST',
+        headers: { 'x-goog-api-key': 'page-placeholder', 'content-type': 'application/json' },
         body: ${JSON.stringify(JSON.stringify(payload))},
       });
       return {

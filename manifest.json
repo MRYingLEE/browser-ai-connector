@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "Use locally stored AI provider credentials from supported browser applications.",
   "permissions": ["storage"],
-  "host_permissions": ["https://api.openai.com/*", "https://api.anthropic.com/*"],
+  "host_permissions": ["https://api.openai.com/*", "https://api.anthropic.com/*", "https://generativelanguage.googleapis.com/*"],
   "background": {
     "service_worker": "src/background.js",
     "type": "module"

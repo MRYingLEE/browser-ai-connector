@@ -89,7 +89,10 @@
     const isAnthropicRequest = requestUrl.protocol === 'https:'
       && requestUrl.hostname === 'api.anthropic.com'
       && requestUrl.pathname === '/v1/messages';
-    if (!isOpenAiRequest && !isAnthropicRequest) {
+    const isGoogleRequest = requestUrl.protocol === 'https:'
+      && requestUrl.hostname === 'generativelanguage.googleapis.com'
+      && /^\/v1(?:beta)?\/models\/[^/]+:(?:generateContent|streamGenerateContent)$/.test(requestUrl.pathname);
+    if (!isOpenAiRequest && !isAnthropicRequest && !isGoogleRequest) {
       return nativeFetch(request);
     }
 
